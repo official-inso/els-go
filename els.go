@@ -2,10 +2,11 @@ package els
 
 import (
 	"context"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mathrand "math/rand"
 	"net/http"
 	"runtime"
 	"strings"
@@ -89,6 +90,17 @@ type Config struct {
 	// Default: "server".
 	DefaultSource string
 
+	// HTTPClient allows providing a custom *http.Client for all ELS requests.
+	// Use this to configure custom TLS, proxies, or request middleware.
+	// Default: &http.Client{Timeout: Config.Timeout}.
+	HTTPClient *http.Client
+
+	// SampleRate controls what fraction of entries are actually sent (0.0 to 1.0).
+	// 1.0 means send everything (default). 0.5 means send ~50% of entries.
+	// Critical-level entries are never sampled (always sent).
+	// Default: 1.0.
+	SampleRate float64
+
 	// Debug enables verbose internal logging to stderr.
 	Debug bool
 }
@@ -124,6 +136,9 @@ func (c *Config) applyDefaults() {
 	if c.DefaultSource == "" {
 		c.DefaultSource = SourceServer
 	}
+	if c.SampleRate <= 0 || c.SampleRate > 1.0 {
+		c.SampleRate = 1.0
+	}
 }
 
 // Client is the main ELS SDK instance. It is safe for concurrent use.
@@ -136,6 +151,8 @@ type Client struct {
 	closed    atomic.Bool
 	mu        sync.RWMutex
 	sessionID string
+	user      *UserContext
+	stats     Stats
 }
 
 // New creates and starts a new ELS Client. The background worker begins
@@ -322,14 +339,18 @@ func (c *Client) Health(ctx context.Context) error {
 
 // Flush blocks until the current queue is drained or FlushTimeout elapses.
 func (c *Client) Flush() {
-	deadline := time.After(c.config.FlushTimeout)
+	c.FlushWithTimeout(c.config.FlushTimeout)
+}
+
+// FlushWithTimeout blocks until the queue is drained or the given timeout elapses.
+func (c *Client) FlushWithTimeout(timeout time.Duration) {
+	deadline := time.After(timeout)
 	for {
 		select {
 		case <-deadline:
 			return
 		default:
 			if len(c.queue) == 0 {
-				// Give worker a moment to process the last batch
 				time.Sleep(100 * time.Millisecond)
 				return
 			}
@@ -376,7 +397,16 @@ func (c *Client) enqueue(entry *ErrorEntry) {
 		return
 	}
 
+	// Sampling: critical entries always pass, others sampled by SampleRate
+	if c.config.SampleRate < 1.0 && entry.Level != LevelCritical {
+		if !c.shouldSample() {
+			atomic.AddInt64(&c.stats.Sampled, 1)
+			return
+		}
+	}
+
 	c.enrichDefaults(entry)
+	c.enrichUserContext(entry)
 
 	// BeforeSend hook
 	if c.config.BeforeSend != nil {
@@ -390,16 +420,19 @@ func (c *Client) enqueue(entry *ErrorEntry) {
 	// to prevent sending after Close() has been called.
 	select {
 	case c.queue <- entry:
+		atomic.AddInt64(&c.stats.Enqueued, 1)
 	case <-c.done:
 		return
 	default:
 		// Queue full: drop oldest entry and push new one
+		atomic.AddInt64(&c.stats.Dropped, 1)
 		select {
 		case <-c.queue:
 		default:
 		}
 		select {
 		case c.queue <- entry:
+			atomic.AddInt64(&c.stats.Enqueued, 1)
 		case <-c.done:
 		default:
 		}
@@ -445,10 +478,42 @@ func (c *Client) shouldCapture(level string) bool {
 
 func generateSessionID() string {
 	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := cryptorand.Read(buf); err != nil {
 		return fmt.Sprintf("els-%d", time.Now().UnixNano())
 	}
 	return "els-" + hex.EncodeToString(buf)
+}
+
+// shouldSample returns true based on the configured SampleRate probability.
+func (c *Client) shouldSample() bool {
+	return mathrand.Float64() < c.config.SampleRate
+}
+
+// enrichUserContext attaches user info to the entry's Meta if a user is set.
+func (c *Client) enrichUserContext(entry *ErrorEntry) {
+	c.mu.RLock()
+	user := c.user
+	c.mu.RUnlock()
+
+	if user == nil {
+		return
+	}
+
+	if entry.Meta == nil {
+		entry.Meta = make(map[string]any)
+	}
+	if user.ID != "" {
+		entry.Meta["user.id"] = user.ID
+	}
+	if user.Email != "" {
+		entry.Meta["user.email"] = user.Email
+	}
+	if user.Name != "" {
+		entry.Meta["user.name"] = user.Name
+	}
+	for k, v := range user.Extra {
+		entry.Meta["user."+k] = v
+	}
 }
 
 func captureStack(skip int) string {

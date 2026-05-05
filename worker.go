@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 )
 
@@ -76,10 +77,12 @@ func (c *Client) sendOrBuffer(batch []ErrorEntry) {
 
 	err := c.transport.sendBatch(ctx, batch)
 	if err == nil {
+		atomic.AddInt64(&c.stats.Sent, int64(len(batch)))
 		return
 	}
 
 	// Send failed — write to disk buffer
+	atomic.AddInt64(&c.stats.Failed, int64(len(batch)))
 	if c.config.OnError != nil {
 		c.config.OnError(fmt.Errorf("send failed, buffering to disk: %w", err))
 	}

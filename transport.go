@@ -21,10 +21,14 @@ type httpTransport struct {
 }
 
 func newHTTPTransport(config Config) *httpTransport {
+	httpClient := config.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: config.Timeout}
+	}
 	return &httpTransport{
 		endpoint:   config.Endpoint,
 		apiKey:     config.APIKey,
-		httpClient: &http.Client{Timeout: config.Timeout},
+		httpClient: httpClient,
 		maxRetries: config.MaxRetries,
 		baseDelay:  config.RetryBaseDelay,
 	}
