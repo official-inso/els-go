@@ -6,10 +6,15 @@
 // Key features:
 //   - Zero external dependencies (stdlib only)
 //   - Asynchronous batching with configurable interval and batch size
+//   - Synchronous send via SendSync for critical errors requiring confirmation
 //   - Automatic retry with exponential backoff and 429 rate-limit handling
+//   - Typed errors (SendError) distinguishing retryable from permanent failures
 //   - Disk buffer for offline resilience (entries survive process restarts)
+//   - Configurable max buffer file size to prevent unbounded disk usage
+//   - Level filtering via MinLevel to drop low-severity entries
 //   - Graceful shutdown with queue draining
-//   - net/http middleware for automatic panic recovery
+//   - net/http middleware for automatic panic recovery (Middleware and RecoverMiddleware)
+//   - Health check endpoint verification
 //   - BeforeSend hook for filtering or mutating entries
 //   - Process-level session ID for correlating related errors
 //
@@ -26,5 +31,9 @@
 //	}
 //	defer client.Close()
 //
-//	client.CaptureError(errors.New("something went wrong"))
+//	// Async (non-blocking)
+//	client.CaptureError(errors.New("something went wrong"), els.WithURL("/api"))
+//
+//	// Sync (blocks until confirmed)
+//	err = client.SendSync(ctx, errors.New("critical failure"), els.WithURL("/api"))
 package els

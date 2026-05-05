@@ -31,14 +31,27 @@ func newHTTPTransport(config Config) *httpTransport {
 }
 
 // sendBatch sends a batch of entries to the ELS API.
-// Returns nil on success, or an error after all retries are exhausted.
+// Returns nil on success, a *SendError on failure.
 func (t *httpTransport) sendBatch(ctx context.Context, entries []ErrorEntry) error {
 	payload, err := json.Marshal(batchRequest{Errors: entries})
 	if err != nil {
-		return fmt.Errorf("els: marshal error: %w", err)
+		return newPermanentError(0, fmt.Errorf("marshal: %w", err))
 	}
+	return t.doWithRetry(ctx, "/errors/batch", payload)
+}
 
-	url := t.endpoint + "/errors/batch"
+// sendSingle sends a single entry to the ELS API.
+func (t *httpTransport) sendSingle(ctx context.Context, entry ErrorEntry) error {
+	payload, err := json.Marshal(entry)
+	if err != nil {
+		return newPermanentError(0, fmt.Errorf("marshal: %w", err))
+	}
+	return t.doWithRetry(ctx, "/errors", payload)
+}
+
+// doWithRetry performs an HTTP POST with retry logic.
+func (t *httpTransport) doWithRetry(ctx context.Context, path string, payload []byte) error {
+	url := t.endpoint + path
 
 	var lastErr error
 	for attempt := 0; attempt <= t.maxRetries; attempt++ {
@@ -46,21 +59,21 @@ func (t *httpTransport) sendBatch(ctx context.Context, entries []ErrorEntry) err
 			delay := t.baseDelay * time.Duration(1<<(attempt-1))
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return newRetryableError(0, ctx.Err())
 			case <-time.After(delay):
 			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 		if err != nil {
-			return fmt.Errorf("els: create request: %w", err)
+			return newPermanentError(0, fmt.Errorf("create request: %w", err))
 		}
 		req.Header.Set("Authorization", "Bearer "+t.apiKey)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := t.httpClient.Do(req)
 		if err != nil {
-			lastErr = err
+			lastErr = newRetryableError(0, err)
 			continue
 		}
 
@@ -79,95 +92,27 @@ func (t *httpTransport) sendBatch(ctx context.Context, entries []ErrorEntry) err
 					delay = time.Duration(n) * time.Second
 				}
 			}
+			lastErr = newRetryableError(429, fmt.Errorf("%s", string(body)))
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return newRetryableError(0, ctx.Err())
 			case <-time.After(delay):
 			}
 			continue
 		}
 
-		// Server error — retry
+		// Server error — retryable
 		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("els: server error %d: %s", resp.StatusCode, string(body))
+			lastErr = newRetryableError(resp.StatusCode, fmt.Errorf("%s", string(body)))
 			continue
 		}
 
-		// Client error (4xx except 429) — do not retry
-		return fmt.Errorf("els: client error %d: %s", resp.StatusCode, string(body))
+		// Client error (4xx except 429) — permanent, do not retry
+		return newPermanentError(resp.StatusCode, fmt.Errorf("%s", string(body)))
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("els: request failed after %d retries", t.maxRetries)
-	}
-	return lastErr
-}
-
-// sendSingle sends a single entry to the ELS API.
-func (t *httpTransport) sendSingle(ctx context.Context, entry ErrorEntry) error {
-	payload, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("els: marshal error: %w", err)
-	}
-
-	url := t.endpoint + "/errors"
-
-	var lastErr error
-	for attempt := 0; attempt <= t.maxRetries; attempt++ {
-		if attempt > 0 {
-			delay := t.baseDelay * time.Duration(1<<(attempt-1))
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-		if err != nil {
-			return fmt.Errorf("els: create request: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+t.apiKey)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := t.httpClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return nil
-		}
-
-		if resp.StatusCode == 429 && attempt < t.maxRetries {
-			delay := t.baseDelay * time.Duration(1<<attempt)
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				if n, err := strconv.Atoi(ra); err == nil {
-					delay = time.Duration(n) * time.Second
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-			continue
-		}
-
-		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("els: server error %d: %s", resp.StatusCode, string(body))
-			continue
-		}
-
-		return fmt.Errorf("els: client error %d: %s", resp.StatusCode, string(body))
-	}
-
-	if lastErr == nil {
-		lastErr = fmt.Errorf("els: request failed after %d retries", t.maxRetries)
+		lastErr = newRetryableError(0, fmt.Errorf("request failed after %d retries", t.maxRetries))
 	}
 	return lastErr
 }

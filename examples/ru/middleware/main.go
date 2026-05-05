@@ -42,7 +42,6 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/users", func(w http.ResponseWriter, r *http.Request) {
-		// Имитация ошибки в бизнес-логике
 		userID := r.URL.Query().Get("id")
 		if userID == "" {
 			// Ручной захват нефатальной ошибки
@@ -64,22 +63,12 @@ func main() {
 		panic("неожиданный nil pointer при поиске пользователя")
 	})
 
-	// Оборачиваем mux middleware для перехвата паник.
-	// Любая паника в хендлерах будет захвачена как CRITICAL ошибка.
-	handler := client.Middleware(mux)
-
-	// Добавляем recovery-обработчик сверху, чтобы сервер не падал
-	safeHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if rv := recover(); rv != nil {
-				http.Error(w, "Внутренняя ошибка сервера", http.StatusInternalServerError)
-			}
-		}()
-		handler.ServeHTTP(w, r)
-	})
+	// RecoverMiddleware — перехватывает панику И возвращает 500 ответ.
+	// (Используйте client.Middleware() если у вас есть свой recovery-слой.)
+	handler := client.RecoverMiddleware(mux)
 
 	addr := ":8080"
 	fmt.Printf("Сервер слушает на %s\n", addr)
 	fmt.Println("Попробуйте: GET /api/health, GET /api/users?id=1, GET /api/panic")
-	log.Fatal(http.ListenAndServe(addr, safeHandler))
+	log.Fatal(http.ListenAndServe(addr, handler))
 }

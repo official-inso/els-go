@@ -23,13 +23,9 @@ func (c *Client) worker() {
 
 	for {
 		select {
-		case entry, ok := <-c.queue:
-			if !ok {
-				// Channel closed during shutdown — drain remaining
-				if len(batch) > 0 {
-					c.sendOrBuffer(batch)
-				}
-				return
+		case entry := <-c.queue:
+			if entry == nil {
+				continue
 			}
 			batch = append(batch, *entry)
 			if len(batch) >= c.config.BatchSize {
@@ -44,28 +40,31 @@ func (c *Client) worker() {
 			}
 
 		case <-c.done:
-			// Drain queue
-			for {
-				select {
-				case entry, ok := <-c.queue:
-					if !ok {
-						if len(batch) > 0 {
-							c.sendOrBuffer(batch)
-						}
-						return
-					}
-					batch = append(batch, *entry)
-					if len(batch) >= c.config.BatchSize {
-						c.sendOrBuffer(batch)
-						batch = make([]ErrorEntry, 0, c.config.BatchSize)
-					}
-				default:
-					if len(batch) > 0 {
-						c.sendOrBuffer(batch)
-					}
-					return
-				}
+			// Drain remaining entries from queue
+			c.drainQueue(&batch)
+			if len(batch) > 0 {
+				c.sendOrBuffer(batch)
 			}
+			return
+		}
+	}
+}
+
+// drainQueue reads all remaining entries from the queue into the batch.
+func (c *Client) drainQueue(batch *[]ErrorEntry) {
+	for {
+		select {
+		case entry := <-c.queue:
+			if entry == nil {
+				continue
+			}
+			*batch = append(*batch, *entry)
+			if len(*batch) >= c.config.BatchSize {
+				c.sendOrBuffer(*batch)
+				*batch = make([]ErrorEntry, 0, c.config.BatchSize)
+			}
+		default:
+			return
 		}
 	}
 }
@@ -97,8 +96,19 @@ func (c *Client) bufferFilePath() string {
 }
 
 // writeToDisk appends entries to the disk buffer file in JSONL format.
+// Respects MaxBufferFileSize — if the file exceeds the limit, new entries are dropped.
 func (c *Client) writeToDisk(entries []ErrorEntry) {
 	path := c.bufferFilePath()
+
+	// Check file size limit before writing
+	if info, err := os.Stat(path); err == nil {
+		if info.Size() >= c.config.MaxBufferFileSize {
+			if c.config.OnError != nil {
+				c.config.OnError(fmt.Errorf("els: disk buffer full (%d bytes), dropping %d entries", info.Size(), len(entries)))
+			}
+			return
+		}
+	}
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {

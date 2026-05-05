@@ -8,11 +8,16 @@
 
 - **Без внешних зависимостей** — только стандартная библиотека Go
 - **Асинхронная пакетная отправка** — фоновая горутина собирает ошибки и отправляет пачками
+- **Синхронная отправка** — `SendSync()` для критичных ошибок с подтверждением доставки
 - **Автоматические повторы** — экспоненциальная задержка с обработкой 429 rate-limit
+- **Типизированные ошибки** — различение retryable/permanent через `IsRetryableErr()`
 - **Буферизация на диск** — неотправленные записи сохраняются и повторно отправляются при следующем запуске
+- **Фильтрация по уровню** — отбрасывание debug/info в production через `MinLevel`
 - **Middleware для panic recovery** — автоматический перехват паник в HTTP-хендлерах
+- **Health check** — проверка доступности сервера ELS
 - **Хук BeforeSend** — фильтрация или модификация записей перед отправкой
 - **Трекинг сессий** — автоматический session ID для корреляции связанных ошибок
+- **Корректное завершение** — `Close()` опустошает очередь и сохраняет остаток
 
 ## Установка
 
@@ -26,6 +31,7 @@ go get github.com/official-inso/els-go
 package main
 
 import (
+    "context"
     "errors"
     "log"
 
@@ -45,16 +51,20 @@ func main() {
     }
     defer client.Close()
 
-    // Захват ошибки (асинхронно, неблокирующе)
-    client.CaptureError(errors.New("таймаут подключения к базе данных"),
+    // Асинхронный захват (неблокирующий)
+    client.CaptureError(errors.New("что-то пошло не так"),
         els.WithURL("/api/users"),
-        els.WithLevel(els.LevelCritical),
+        els.WithLevel(els.LevelError),
     )
 
-    // Захват информационного сообщения
-    client.CaptureMessage("сервис успешно запущен", els.LevelInfo,
-        els.WithURL("/"),
-    )
+    // Синхронная отправка для критичных ошибок (блокирует до подтверждения)
+    ctx := context.Background()
+    if err := client.SendSync(ctx, errors.New("ошибка платежа"),
+        els.WithURL("/api/pay"),
+        els.WithLevel(els.LevelCritical),
+    ); err != nil {
+        log.Printf("не удалось отправить: %v", err)
+    }
 }
 ```
 
@@ -71,14 +81,56 @@ func main() {
 | `BatchInterval` | Duration | `5s` | Макс. время до отправки неполной пачки |
 | `BufferSize` | int | `1000` | Ёмкость очереди в памяти |
 | `MaxRetries` | int | `3` | Количество повторных попыток |
-| `RetryBaseDelay` | Duration | `1s` | Начальная задержка между попытками (удваивается) |
+| `RetryBaseDelay` | Duration | `1s` | Начальная задержка (удваивается) |
 | `Timeout` | Duration | `10s` | Таймаут HTTP-запроса |
+| `FlushTimeout` | Duration | `10s` | Макс. время ожидания Flush() |
 | `BufferDir` | string | `os.TempDir()` | Директория для файла буфера |
-| `BeforeSend` | func | `nil` | Хук для фильтрации/мутации записей |
+| `MaxBufferFileSize` | int64 | `100MB` | Макс. размер файла буфера |
+| `MinLevel` | string | `""` | Минимальный уровень для захвата |
+| `BeforeSend` | func | `nil` | Хук для фильтрации/мутации |
 | `OnError` | func | `nil` | Коллбек внутренних ошибок |
-| `DefaultLevel` | string | `"error"` | Уровень серьёзности по умолчанию |
+| `DefaultLevel` | string | `"error"` | Уровень по умолчанию |
 | `DefaultSource` | string | `"server"` | Источник по умолчанию |
-| `Debug` | bool | `false` | Включить отладочный вывод |
+| `Debug` | bool | `false` | Отладочный вывод |
+
+## Синхронная отправка
+
+Для критичных ошибок, где доставка должна быть подтверждена:
+
+```go
+err := client.SendSync(ctx, errors.New("ошибка платежа"),
+    els.WithURL("/api/payments"),
+    els.WithLevel(els.LevelCritical),
+)
+if err != nil {
+    if els.IsRetryableErr(err) {
+        // Проблема сервера/сети — можно повторить позже
+    } else {
+        // Постоянная ошибка (авторизация, валидация) — не повторять
+    }
+}
+```
+
+## Фильтрация по уровню
+
+Отбрасывание малозначимых записей в production:
+
+```go
+client, _ := els.New(els.Config{
+    // ...
+    MinLevel: els.LevelWarning, // отбрасывает debug и info
+})
+```
+
+Приоритет уровней: `debug` < `info` < `warning` < `error` < `critical`
+
+## Health Check
+
+```go
+if err := client.Health(ctx); err != nil {
+    log.Printf("ELS недоступен: %v", err)
+}
+```
 
 ## HTTP Middleware
 
@@ -86,13 +138,16 @@ func main() {
 mux := http.NewServeMux()
 mux.HandleFunc("/api/health", healthHandler)
 
-// Оборачиваем для автоматического перехвата паник
-http.ListenAndServe(":8080", client.Middleware(mux))
+// Вариант 1: Перехватывает панику и пробрасывает дальше
+handler := client.Middleware(mux)
+
+// Вариант 2: Перехватывает панику и возвращает 500 (standalone)
+handler := client.RecoverMiddleware(mux)
+
+http.ListenAndServe(":8080", handler)
 ```
 
 ## Опции захвата
-
-Опции передаются в `CaptureError`, `CaptureMessage` и `CaptureEntry`:
 
 ```go
 client.CaptureError(err,
@@ -100,28 +155,43 @@ client.CaptureError(err,
     els.WithURL("/api/orders/123"),
     els.WithSource(els.SourceServer),
     els.WithUserAgent("CustomBot/1.0"),
-    els.WithMeta(map[string]any{"orderId": "123", "userId": "456"}),
+    els.WithLanguage("ru-RU"),
+    els.WithReferrer("http://example.com"),
+    els.WithMeta(map[string]any{"orderId": "123"}),
     els.WithSessionID("custom-session-id"),
+    els.WithServiceName("payment-worker"),
+    els.WithStack(customStackTrace),
+    els.WithComponentStack(reactTrace),
 )
 ```
 
 ## Буферизация на диск
 
-Когда ELS-сервер недоступен после всех повторов, записи сохраняются в файл `.els-buffer.jsonl` в директории `BufferDir` (по умолчанию — системная временная директория). При следующем запуске клиента буфер автоматически отправляется.
+Когда ELS-сервер недоступен, записи сохраняются в `.els-buffer.jsonl`. При следующем запуске буфер автоматически отправляется. Файл ограничен `MaxBufferFileSize` (по умолчанию 100MB) — при превышении новые записи отбрасываются.
 
 ## Корректное завершение
-
-Всегда вызывайте `client.Close()` перед завершением приложения:
 
 ```go
 client, _ := els.New(config)
 defer client.Close()
 ```
 
-`Close()` выполнит:
-1. Остановку приёма новых записей
-2. Отправку всех оставшихся записей в очереди
-3. Сохранение неотправленных записей на диск (если отправка не удалась)
+`Close()`:
+1. Прекращает приём новых записей
+2. Отправляет все оставшиеся записи в очереди
+3. Сохраняет неотправленные записи на диск
+
+## Типизированные ошибки
+
+Все операции отправки возвращают `*SendError`:
+
+```go
+err := client.SendSync(ctx, myErr)
+var sendErr *els.SendError
+if els.As(err, &sendErr) {
+    fmt.Printf("Статус: %d, Повторяемая: %v\n", sendErr.StatusCode, sendErr.IsRetryable)
+}
+```
 
 ## Описание полей
 

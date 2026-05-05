@@ -42,7 +42,6 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/users", func(w http.ResponseWriter, r *http.Request) {
-		// Simulate an error in business logic
 		userID := r.URL.Query().Get("id")
 		if userID == "" {
 			// Manually capture a non-fatal error
@@ -64,22 +63,12 @@ func main() {
 		panic("unexpected nil pointer in user lookup")
 	})
 
-	// Wrap the mux with ELS panic recovery middleware.
-	// Any panic in handlers will be captured as a CRITICAL error.
-	handler := client.Middleware(mux)
-
-	// Add a recovery handler on top so the server doesn't crash
-	safeHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if rv := recover(); rv != nil {
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-		}()
-		handler.ServeHTTP(w, r)
-	})
+	// Use RecoverMiddleware — captures panics AND returns 500 response.
+	// (Use client.Middleware() instead if you have your own recovery layer.)
+	handler := client.RecoverMiddleware(mux)
 
 	addr := ":8080"
 	fmt.Printf("Server listening on %s\n", addr)
 	fmt.Println("Try: GET /api/health, GET /api/users?id=1, GET /api/panic")
-	log.Fatal(http.ListenAndServe(addr, safeHandler))
+	log.Fatal(http.ListenAndServe(addr, handler))
 }

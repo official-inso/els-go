@@ -1,13 +1,16 @@
 package els
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,9 +56,22 @@ type Config struct {
 	// Default: 10 seconds.
 	Timeout time.Duration
 
+	// FlushTimeout is the maximum time Flush() will wait for the queue to drain.
+	// Default: 10 seconds.
+	FlushTimeout time.Duration
+
 	// BufferDir is the directory for disk-based buffering when the server is unreachable.
 	// Default: os.TempDir().
 	BufferDir string
+
+	// MaxBufferFileSize is the maximum size of the disk buffer file in bytes.
+	// When exceeded, oldest entries are discarded. Default: 100 MB.
+	MaxBufferFileSize int64
+
+	// MinLevel is the minimum severity level to capture. Entries below this level
+	// are silently dropped. Order: debug < info < warning < error < critical.
+	// Default: "" (capture all levels).
+	MinLevel string
 
 	// BeforeSend is called before each entry is enqueued.
 	// Return nil to drop the entry. Modify the entry in-place to mutate it.
@@ -96,6 +112,12 @@ func (c *Config) applyDefaults() {
 	if c.Timeout <= 0 {
 		c.Timeout = 10 * time.Second
 	}
+	if c.FlushTimeout <= 0 {
+		c.FlushTimeout = 10 * time.Second
+	}
+	if c.MaxBufferFileSize <= 0 {
+		c.MaxBufferFileSize = 100 * 1024 * 1024 // 100 MB
+	}
 	if c.DefaultLevel == "" {
 		c.DefaultLevel = LevelError
 	}
@@ -111,8 +133,8 @@ type Client struct {
 	transport *httpTransport
 	wg        sync.WaitGroup
 	done      chan struct{}
+	closed    atomic.Bool
 	mu        sync.RWMutex
-	closed    bool
 	sessionID string
 }
 
@@ -205,15 +227,109 @@ func (c *Client) CaptureEntry(entry ErrorEntry, opts ...CaptureOption) {
 	c.enqueue(&entry)
 }
 
-// Flush blocks until the current queue is drained or 10 seconds elapse.
+// SendSync sends a single error synchronously, waiting for server confirmation.
+// Use this for critical errors where delivery must be guaranteed (e.g., payment failures).
+// Unlike CaptureError, this blocks until the entry is delivered or the context expires.
+func (c *Client) SendSync(ctx context.Context, err error, opts ...CaptureOption) error {
+	if err == nil {
+		return nil
+	}
+
+	entry := &ErrorEntry{
+		Message:   err.Error(),
+		Stack:     captureStack(3),
+		Level:     c.config.DefaultLevel,
+		Source:    c.config.DefaultSource,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		SessionID: c.SessionID(),
+	}
+
+	for _, opt := range opts {
+		opt(entry)
+	}
+
+	c.enrichDefaults(entry)
+
+	if c.config.BeforeSend != nil {
+		entry = c.config.BeforeSend(entry)
+		if entry == nil {
+			return nil
+		}
+	}
+
+	if !c.shouldCapture(entry.Level) {
+		return nil
+	}
+
+	return c.transport.sendSingle(ctx, *entry)
+}
+
+// SendSyncEntry sends a pre-built entry synchronously.
+func (c *Client) SendSyncEntry(ctx context.Context, entry ErrorEntry, opts ...CaptureOption) error {
+	if entry.Timestamp == "" {
+		entry.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if entry.Level == "" {
+		entry.Level = c.config.DefaultLevel
+	}
+	if entry.Source == "" {
+		entry.Source = c.config.DefaultSource
+	}
+	if entry.SessionID == "" {
+		entry.SessionID = c.SessionID()
+	}
+
+	for _, opt := range opts {
+		opt(&entry)
+	}
+
+	c.enrichDefaults(&entry)
+
+	if c.config.BeforeSend != nil {
+		result := c.config.BeforeSend(&entry)
+		if result == nil {
+			return nil
+		}
+		entry = *result
+	}
+
+	if !c.shouldCapture(entry.Level) {
+		return nil
+	}
+
+	return c.transport.sendSingle(ctx, entry)
+}
+
+// Health checks connectivity to the ELS server. Returns nil if the server is reachable.
+func (c *Client) Health(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.config.Endpoint+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("els: create health request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+
+	resp, err := c.transport.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("els: health check failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("els: health check returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Flush blocks until the current queue is drained or FlushTimeout elapses.
 func (c *Client) Flush() {
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(c.config.FlushTimeout)
 	for {
 		select {
 		case <-deadline:
 			return
 		default:
 			if len(c.queue) == 0 {
+				// Give worker a moment to process the last batch
 				time.Sleep(100 * time.Millisecond)
 				return
 			}
@@ -224,17 +340,15 @@ func (c *Client) Flush() {
 
 // Close performs graceful shutdown: signals the worker to stop, drains the
 // queue, flushes remaining entries, and persists any unsent entries to disk.
-func (c *Client) Close() {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return
+// Implements io.Closer.
+func (c *Client) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil // already closed
 	}
-	c.closed = true
-	c.mu.Unlock()
 
 	close(c.done)
 	c.wg.Wait()
+	return nil
 }
 
 // SessionID returns the process-level session identifier.
@@ -251,25 +365,18 @@ func (c *Client) SetSessionID(id string) {
 	c.sessionID = id
 }
 
-func (c *Client) enqueue(entry *ErrorEntry) {
-	c.mu.RLock()
-	closed := c.closed
-	c.mu.RUnlock()
+// --- Internal ---
 
-	if closed {
+func (c *Client) enqueue(entry *ErrorEntry) {
+	if c.closed.Load() {
 		return
 	}
 
-	// Enrich with config defaults
-	if entry.AppSlug == "" {
-		entry.AppSlug = c.config.AppSlug
+	if !c.shouldCapture(entry.Level) {
+		return
 	}
-	if entry.DeploymentEnv == "" {
-		entry.DeploymentEnv = c.config.DeploymentEnv
-	}
-	if entry.ServiceName == "" {
-		entry.ServiceName = c.config.ServiceName
-	}
+
+	c.enrichDefaults(entry)
 
 	// BeforeSend hook
 	if c.config.BeforeSend != nil {
@@ -279,8 +386,12 @@ func (c *Client) enqueue(entry *ErrorEntry) {
 		}
 	}
 
+	// Non-blocking send to queue. Uses done channel as secondary guard
+	// to prevent sending after Close() has been called.
 	select {
 	case c.queue <- entry:
+	case <-c.done:
+		return
 	default:
 		// Queue full: drop oldest entry and push new one
 		select {
@@ -289,9 +400,47 @@ func (c *Client) enqueue(entry *ErrorEntry) {
 		}
 		select {
 		case c.queue <- entry:
+		case <-c.done:
 		default:
 		}
 	}
+}
+
+func (c *Client) enrichDefaults(entry *ErrorEntry) {
+	if entry.AppSlug == "" {
+		entry.AppSlug = c.config.AppSlug
+	}
+	if entry.DeploymentEnv == "" {
+		entry.DeploymentEnv = c.config.DeploymentEnv
+	}
+	if entry.ServiceName == "" {
+		entry.ServiceName = c.config.ServiceName
+	}
+}
+
+// levelPriority returns numeric priority for level comparison.
+var levelPriority = map[string]int{
+	LevelDebug:    0,
+	LevelInfo:     1,
+	LevelWarning:  2,
+	LevelError:    3,
+	LevelCritical: 4,
+}
+
+// shouldCapture returns true if the entry's level meets the MinLevel threshold.
+func (c *Client) shouldCapture(level string) bool {
+	if c.config.MinLevel == "" {
+		return true
+	}
+	minP, ok := levelPriority[c.config.MinLevel]
+	if !ok {
+		return true
+	}
+	entryP, ok := levelPriority[level]
+	if !ok {
+		return true
+	}
+	return entryP >= minP
 }
 
 func generateSessionID() string {
