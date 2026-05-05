@@ -1,73 +1,99 @@
 # Поля записи ошибки ELS
 
-Этот документ описывает все поля записи ошибки, отправляемой в ELS API.
+Все поля, отправляемые Go SDK в ELS API.
 
-## Обязательные поля
+## Обязательные
 
-| Поле | Тип | Описание | Источник |
-|------|-----|----------|----------|
-| `message` | string | Текст ошибки. Макс. 10 000 символов. | `err.Error()` или произвольное сообщение |
-| `url` | string | URL, где произошла ошибка. Макс. 2 000 символов. | URL запроса. Используйте `WithURL()` |
-| `timestamp` | string | Метка времени ISO 8601 (RFC3339). | Автоматически заполняется SDK (UTC) |
+| Поле | Тип | Макс. длина | Описание |
+|------|-----|-------------|----------|
+| `message` | string | 10 000 | Текст ошибки |
+| `url` | string | 2 000 | URL, где произошла ошибка. Используйте `WithURL()` или `WithRequest(r)` |
 
-## Автоматически заполняемые поля
+## Автоматически заполняемые
 
-Эти поля заполняются SDK автоматически. Вам не нужно их устанавливать.
+SDK заполняет их сам — не нужно устанавливать вручную.
 
-| Поле | Тип | Описание | Как заполняется |
-|------|-----|----------|-----------------|
-| `timestamp` | string | Когда произошла ошибка | `time.Now().UTC().Format(time.RFC3339Nano)` |
-| `sessionId` | string | ID сессии процесса для корреляции ошибок | Генерируется при создании клиента (`els-<hex>`) |
-| `appSlug` | string | Идентификатор приложения | Из `Config.AppSlug` |
-| `deploymentEnv` | string | Окружение развёртывания | Из `Config.DeploymentEnv` |
-| `serviceName` | string | Название микросервиса | Из `Config.ServiceName` |
-| `level` | string | Уровень серьёзности | Из `Config.DefaultLevel` (по умолчанию: `"error"`) |
-| `source` | string | Источник ошибки | Из `Config.DefaultSource` (по умолчанию: `"server"`) |
-| `stack` | string | Stack trace | Автозахват через `runtime.Callers` для `CaptureError()` |
+| Поле | Источник | Описание |
+|------|----------|----------|
+| `timestamp` | `time.Now().UTC()` | ISO 8601 (RFC3339Nano) |
+| `level` | `Config.DefaultLevel` | Серьёзность: critical/error/warning/info/debug |
+| `source` | `Config.DefaultSource` | Источник: server/client |
+| `appSlug` | `Config.AppSlug` | Идентификатор приложения |
+| `deploymentEnv` | `Config.DeploymentEnv` | Нормализуется сервером (dev→DEV, prod→PRODUCTION) |
+| `serviceName` | `Config.ServiceName` | Название микросервиса |
+| `sessionId` | Автогенерация | ID сессии процесса для корреляции |
+| `stack` | `runtime.Callers` | Stack trace (только для `CaptureError`) |
 
-## Опциональные поля
+## Опциональные
 
-| Поле | Тип | Описание | Когда использовать |
-|------|-----|----------|--------------------|
-| `stack` | string | Stack trace. Макс. 50 000 символов. | Автозахват для `CaptureError()`. `WithStack()` для переопределения |
-| `componentStack` | string | Трейс компонентов фреймворка (React и пр.) | Только для frontend-ошибок. `WithComponentStack()` |
-| `userAgent` | string | HTTP заголовок User-Agent. Макс. 1 000 символов. | `r.UserAgent()`. Используйте `WithUserAgent()` |
-| `language` | string | Локаль клиента (напр., "ru-RU"). Макс. 20 символов. | `r.Header.Get("Accept-Language")`. `WithLanguage()` |
-| `screenSize` | string | Размер экрана ("1920x1080"). Макс. 20 символов. | Только на клиенте |
-| `viewportSize` | string | Размер вьюпорта. Макс. 20 символов. | Только на клиенте |
-| `referrer` | string | HTTP заголовок Referer. Макс. 2 000 символов. | `r.Referer()`. Используйте `WithReferrer()` |
-| `meta` | map | Произвольные метаданные (ключ-значение) | Любой доп. контекст. `WithMeta()` |
+Устанавливаются через опции (`WithX()`) или напрямую в `ErrorEntry`:
+
+| Поле | Тип | Макс. | Опция | Описание |
+|------|-----|-------|-------|----------|
+| `stack` | string | 50 000 | `WithStack(s)` | Переопределить авто-stack |
+| `componentStack` | string | 50 000 | `WithComponentStack(s)` | Трейс компонентов фреймворка |
+| `userAgent` | string | 1 000 | `WithUserAgent(ua)` | User-Agent клиента |
+| `language` | string | 20 | `WithLanguage(l)` | Локаль (напр., "ru-RU") |
+| `screenSize` | string | 20 | — | Экран "WxH" (только клиент) |
+| `viewportSize` | string | 20 | — | Вьюпорт "WxH" (только клиент) |
+| `referrer` | string | 2 000 | `WithReferrer(r)` | HTTP Referer |
+| `meta` | object | — | `WithMeta(m)` | Произвольные данные |
+
+## Удобные опции
+
+| Опция | Что делает |
+|-------|-----------|
+| `WithRequest(r *http.Request)` | Извлекает URL, UserAgent, Referrer, Language + добавляет `http.method`, `http.host`, `http.remoteAddr`, `http.requestId` в Meta |
+| `WithCause(err)` | Обходит цепочку `Unwrap()`, сохраняет причины в `meta["error.causes"]` |
 
 ## Значения Level
 
-| Значение | Когда использовать |
-|----------|-------------------|
-| `critical` | Система упала или потеря данных |
-| `error` | Операция провалилась, но система работает |
-| `warning` | Потенциальная проблема без сбоя |
-| `info` | Значимое событие (запуск, смена конфига) |
-| `debug` | Детальная диагностическая информация |
+| Значение | Константа | Когда использовать |
+|----------|-----------|-------------------|
+| `critical` | `els.LevelCritical` | Падение системы, потеря данных |
+| `error` | `els.LevelError` | Операция провалилась |
+| `warning` | `els.LevelWarning` | Потенциальная проблема |
+| `info` | `els.LevelInfo` | Значимое событие |
+| `debug` | `els.LevelDebug` | Диагностика |
 
 ## Значения Source
 
-| Значение | Описание |
-|----------|----------|
-| `server` | Ошибка произошла на сервере/бэкенде |
-| `client` | Ошибка произошла на клиенте/фронтенде |
+| Значение | Константа | Описание |
+|----------|-----------|----------|
+| `server` | `els.SourceServer` | Ошибка бэкенда |
+| `client` | `els.SourceClient` | Ошибка фронтенда |
 
-## Значения DeploymentEnv
+## Нормализация окружения
 
-Сервер нормализует значения окружения без учёта регистра:
+Сервер нормализует `deploymentEnv` без учёта регистра:
 
-| Ввод (любой регистр) | Хранится как |
-|----------------------|--------------|
-| `dev`, `development`, `test` | `DEV` |
-| `staging`, `stage`, `stg` | `STAGING` |
-| `prod`, `production` | `PRODUCTION` |
-| Любое другое з��ачение | Приводится к верхнему регистру |
+| Отправляете | Хранится как |
+|-------------|--------------|
+| dev, development, test | `DEV` |
+| staging, stage, stg | `STAGING` |
+| prod, production | `PRODUCTION` |
+| остальное | UPPERCASE |
 
-## Примечания
+## Поля, генерируемые сервером
 
-- `traceId` генерируется на сервере и не может быть установлен клиентом
-- `message` и `url` — единственные действительно обязательные поля, все остальные имеют значения по умолчанию или опциональны
-- Сервер вычисляет дополнительные поля: `browser` (из userAgent), `urlPath` (из url), `errorCategory` (из message), `fingerprint` (из message+stack+source), `ip` (из запроса)
+Эти поля вычисляются на стороне сервера (нельзя установить клиентом):
+
+| Поле | Описание |
+|------|----------|
+| `traceId` | Уникальный ID (формат: `SRV-<timestamp>-<random>`) |
+| `browser` | Определяется из userAgent |
+| `urlPath` | Нормализованный путь (UUID → `:id`) |
+| `errorCategory` | Автокатегоризация из message |
+| `fingerprint` | Хеш от message + stack + source |
+| `ip` | IP клиента из запроса |
+
+## Поля контекста пользователя
+
+При вызове `SetUser()` эти поля автоматически добавляются в Meta:
+
+| Ключ в Meta | Источник |
+|-------------|----------|
+| `user.id` | `UserContext.ID` |
+| `user.email` | `UserContext.Email` |
+| `user.name` | `UserContext.Name` |
+| `user.<key>` | `UserContext.Extra[key]` |

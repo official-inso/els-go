@@ -1,25 +1,10 @@
 # ELS Go SDK
 
-A high-performance, asynchronous Go SDK for the [Error Logs Service (ELS)](https://github.com/official-inso/els-go).
+High-performance Go SDK for [Error Logs Service](https://github.com/official-inso/els-go). Zero dependencies, async batching, disk buffering.
 
 [Русская версия](README_RU.md)
 
-## Features
-
-- **Zero external dependencies** — stdlib only
-- **Asynchronous batching** — background goroutine collects entries and sends them in efficient batches
-- **Synchronous send** — `SendSync()` for critical errors that must be confirmed
-- **Automatic retries** — exponential backoff with 429 rate-limit handling
-- **Typed errors** — distinguish retryable vs permanent failures with `IsRetryableErr()`
-- **Disk buffering** — unsent entries are persisted to disk and retried on next startup
-- **Level filtering** — drop low-severity entries in production with `MinLevel`
-- **Panic recovery middleware** — automatic capture of HTTP handler panics
-- **Health check** — verify ELS server connectivity before operations
-- **BeforeSend hook** — filter or mutate entries before they are sent
-- **Session tracking** — automatic per-process session ID for error correlation
-- **Graceful shutdown** — `Close()` drains queue and persists remaining entries
-
-## Installation
+## Install
 
 ```bash
 go get github.com/official-inso/els-go
@@ -31,7 +16,6 @@ go get github.com/official-inso/els-go
 package main
 
 import (
-    "context"
     "errors"
     "log"
 
@@ -39,92 +23,135 @@ import (
 )
 
 func main() {
-    client, err := els.New(els.Config{
+    // Option A: global client (recommended for most apps)
+    els.Init(els.Config{
         Endpoint:      "https://api.example.com/els",
         APIKey:        "your-api-key",
         AppSlug:       "my-service",
         DeploymentEnv: "PRODUCTION",
-        ServiceName:   "api-gateway",
     })
-    if err != nil {
-        log.Fatal(err)
-    }
+    defer els.Close()
+
+    els.CaptureErrorGlobal(errors.New("something broke"), els.WithURL("/api/users"))
+
+    // Option B: explicit client (for libraries or multiple instances)
+    client, err := els.New(els.Config{...})
+    if err != nil { log.Fatal(err) }
     defer client.Close()
 
-    // Async capture (non-blocking)
-    client.CaptureError(errors.New("something went wrong"),
-        els.WithURL("/api/users"),
-        els.WithLevel(els.LevelError),
-    )
-
-    // Sync send for critical errors (blocks until confirmed)
-    ctx := context.Background()
-    if err := client.SendSync(ctx, errors.New("payment failed"),
-        els.WithURL("/api/pay"),
-        els.WithLevel(els.LevelCritical),
-    ); err != nil {
-        log.Printf("failed to report: %v", err)
-    }
+    client.CaptureError(errors.New("db timeout"), els.WithURL("/api/data"))
 }
 ```
 
-## Configuration
+## Core Concepts
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `Endpoint` | string | *required* | Base URL of the ELS API |
-| `APIKey` | string | *required* | API key for authentication |
-| `AppSlug` | string | `""` | Application identifier |
-| `DeploymentEnv` | string | `""` | Environment (DEV, STAGING, PRODUCTION) |
-| `ServiceName` | string | `""` | Microservice name |
-| `BatchSize` | int | `50` | Max entries per batch request |
-| `BatchInterval` | Duration | `5s` | Max time before flushing partial batch |
-| `BufferSize` | int | `1000` | In-memory queue capacity |
-| `MaxRetries` | int | `3` | Retry attempts for failed requests |
-| `RetryBaseDelay` | Duration | `1s` | Initial retry delay (doubles each attempt) |
-| `Timeout` | Duration | `10s` | HTTP request timeout |
-| `FlushTimeout` | Duration | `10s` | Max time for Flush() to wait |
-| `BufferDir` | string | `os.TempDir()` | Directory for disk buffer file |
-| `MaxBufferFileSize` | int64 | `100MB` | Max disk buffer size before dropping |
-| `MinLevel` | string | `""` | Minimum level to capture (filters lower) |
-| `BeforeSend` | func | `nil` | Hook to filter/mutate entries |
-| `OnError` | func | `nil` | Internal error callback |
-| `DefaultLevel` | string | `"error"` | Default severity level |
-| `DefaultSource` | string | `"server"` | Default error source |
-| `Debug` | bool | `false` | Enable debug logging |
+### Async vs Sync
 
-## Synchronous Send
-
-For critical errors where delivery must be confirmed (payments, auth failures):
+Most captures are **async** — they return immediately and the entry is sent in the background:
 
 ```go
-err := client.SendSync(ctx, errors.New("payment failed"),
-    els.WithURL("/api/payments"),
+client.CaptureError(err, els.WithURL("/api"))       // non-blocking
+client.CaptureMessage("started", els.LevelInfo)     // non-blocking
+```
+
+For critical errors where you need **delivery confirmation**, use `SendSync`:
+
+```go
+err := client.SendSync(ctx, paymentErr,
+    els.WithURL("/api/pay"),
     els.WithLevel(els.LevelCritical),
 )
 if err != nil {
-    if els.IsRetryableErr(err) {
-        // Server/network issue — safe to retry later
-    } else {
-        // Permanent error (auth, validation) — don't retry
-    }
+    // Handle: error was NOT delivered
 }
 ```
 
-## Level Filtering
+### Options Pattern
 
-Drop low-severity entries in production:
+Every capture method accepts options to enrich the entry:
 
 ```go
-client, _ := els.New(els.Config{
-    // ...
+client.CaptureError(err,
+    els.WithURL("/api/orders"),
+    els.WithLevel(els.LevelCritical),
+    els.WithMeta(map[string]any{"orderId": "123"}),
+    els.WithRequest(httpReq),        // auto-extracts URL, UA, Referrer, headers
+    els.WithCause(err),              // preserves error chain in meta
+    els.WithSessionID("req-abc"),
+)
+```
+
+Full list: `WithURL`, `WithLevel`, `WithSource`, `WithStack`, `WithMeta`, `WithUserAgent`, `WithLanguage`, `WithReferrer`, `WithSessionID`, `WithServiceName`, `WithComponentStack`, `WithRequest`, `WithCause`.
+
+---
+
+## Features
+
+### HTTP Middleware
+
+Automatically captures panics in your HTTP handlers:
+
+```go
+mux := http.NewServeMux()
+mux.HandleFunc("/api/data", handler)
+
+// Captures panic + returns 500
+http.ListenAndServe(":8080", client.RecoverMiddleware(mux))
+
+// Captures panic + re-raises (use with your own recovery layer)
+http.ListenAndServe(":8080", client.Middleware(mux))
+```
+
+### User Context
+
+Attach user info to all subsequent captures:
+
+```go
+client.SetUser(&els.UserContext{
+    ID:    "usr_123",
+    Email: "john@example.com",
+    Extra: map[string]string{"tenant": "acme"},
+})
+// All entries now include user.id, user.email, user.tenant in Meta
+```
+
+### Slog Integration
+
+Route Go's standard `log/slog` to ELS:
+
+```go
+logger := slog.New(els.SlogHandler(client, nil))
+slog.SetDefault(logger)
+
+slog.Error("db timeout", "host", "pg-1", "latency_ms", 5200)
+// → captured as ELS error with meta: {"host": "pg-1", "latency_ms": 5200}
+```
+
+### Sampling
+
+Control volume in high-traffic production:
+
+```go
+els.New(els.Config{
+    SampleRate: 0.1, // send ~10% of non-critical entries
+})
+```
+
+Critical-level entries always pass regardless of sample rate.
+
+### Level Filtering
+
+Drop low-severity entries entirely:
+
+```go
+els.New(els.Config{
     MinLevel: els.LevelWarning, // drops debug and info
 })
 ```
 
-Level priority: `debug` < `info` < `warning` < `error` < `critical`
+Priority: `debug` < `info` < `warning` < `error` < `critical`
 
-## Health Check
+### Health Check
 
 ```go
 if err := client.Health(ctx); err != nil {
@@ -132,77 +159,101 @@ if err := client.Health(ctx); err != nil {
 }
 ```
 
-## HTTP Middleware
+### Disk Buffering
+
+When the server is unreachable after retries, entries are saved to `.els-buffer.jsonl`. On next startup, they're automatically re-sent. Capped at `MaxBufferFileSize` (default 100MB).
+
+### Metrics
 
 ```go
-mux := http.NewServeMux()
-mux.HandleFunc("/api/health", healthHandler)
-
-// Option 1: Captures panic and re-raises (use with your own recovery)
-handler := client.Middleware(mux)
-
-// Option 2: Captures panic and returns 500 (standalone)
-handler := client.RecoverMiddleware(mux)
-
-http.ListenAndServe(":8080", handler)
-```
-
-## Capture Options
-
-```go
-client.CaptureError(err,
-    els.WithLevel(els.LevelCritical),
-    els.WithURL("/api/orders/123"),
-    els.WithSource(els.SourceServer),
-    els.WithUserAgent("CustomBot/1.0"),
-    els.WithLanguage("en-US"),
-    els.WithReferrer("http://example.com"),
-    els.WithMeta(map[string]any{"orderId": "123"}),
-    els.WithSessionID("custom-session-id"),
-    els.WithServiceName("payment-worker"),
-    els.WithStack(customStackTrace),
-    els.WithComponentStack(reactTrace),
+stats := client.GetStats()
+log.Printf("queued=%d sent=%d dropped=%d failed=%d sampled=%d queue_size=%d",
+    stats.Enqueued, stats.Sent, stats.Dropped, stats.Failed, stats.Sampled,
+    client.QueueSize(),
 )
 ```
 
-## Disk Buffering
+### Typed Errors
 
-When the ELS server is unreachable after all retries, entries are saved to `.els-buffer.jsonl` in `BufferDir`. On next client startup, the buffer is automatically flushed. The file is capped at `MaxBufferFileSize` (default 100MB) — when exceeded, new entries are dropped.
+Distinguish retryable from permanent failures:
+
+```go
+err := client.SendSync(ctx, myErr)
+if els.IsRetryableErr(err) {
+    // 5xx, 429, network — safe to retry
+} else {
+    // 4xx — don't retry (auth, validation)
+}
+```
+
+---
+
+## Configuration
+
+```go
+els.Config{
+    // Required
+    Endpoint string    // ELS API base URL
+    APIKey   string    // API key
+
+    // Identity (recommended)
+    AppSlug       string // Application identifier
+    DeploymentEnv string // DEV, STAGING, PRODUCTION
+    ServiceName   string // Microservice name
+
+    // Batching
+    BatchSize     int           // Max entries per request (default: 50)
+    BatchInterval time.Duration // Flush interval (default: 5s)
+    BufferSize    int           // In-memory queue capacity (default: 1000)
+
+    // Retry
+    MaxRetries     int           // Retry attempts (default: 3)
+    RetryBaseDelay time.Duration // Initial delay, doubles each attempt (default: 1s)
+    Timeout        time.Duration // HTTP timeout (default: 10s)
+
+    // Buffering
+    BufferDir         string // Disk buffer directory (default: os.TempDir())
+    MaxBufferFileSize int64  // Max buffer file size (default: 100MB)
+
+    // Filtering
+    MinLevel   string  // Minimum level to capture (default: all)
+    SampleRate float64 // 0.0-1.0, critical always passes (default: 1.0)
+
+    // Hooks
+    BeforeSend func(*ErrorEntry) *ErrorEntry // Filter/mutate before send
+    OnError    func(error)                   // Internal error callback
+
+    // Advanced
+    HTTPClient   *http.Client // Custom HTTP client
+    FlushTimeout time.Duration // Flush() max wait (default: 10s)
+    DefaultLevel  string       // Default: "error"
+    DefaultSource string       // Default: "server"
+    Debug         bool         // Verbose logging to stderr
+}
+```
+
+---
 
 ## Graceful Shutdown
 
 ```go
-client, _ := els.New(config)
-defer client.Close()
+defer client.Close() // or defer els.Close() for global
 ```
 
-`Close()` will:
-1. Stop accepting new entries
-2. Drain and send all entries remaining in the queue
-3. Persist any unsent entries to disk
+`Close()` stops new captures → drains queue → sends remaining → buffers unsent to disk.
 
-## Typed Errors
-
-All send operations return `*SendError` which distinguishes retryable from permanent failures:
-
-```go
-err := client.SendSync(ctx, myErr)
-var sendErr *els.SendError
-if els.As(err, &sendErr) {
-    fmt.Printf("Status: %d, Retryable: %v\n", sendErr.StatusCode, sendErr.IsRetryable)
-}
-```
-
-## Field Reference
-
-See [docs/FIELDS.md](docs/FIELDS.md) for a detailed description of all error entry fields.
+---
 
 ## Examples
 
-- [Basic usage (EN)](examples/en/basic/main.go)
-- [HTTP middleware (EN)](examples/en/middleware/main.go)
-- [Basic usage (RU)](examples/ru/basic/main.go)
+- [Basic usage (EN)](examples/en/basic/main.go) — init, capture, sync send, health check
+- [HTTP middleware (EN)](examples/en/middleware/main.go) — panic recovery, manual capture
+- [Базовый пример (RU)](examples/ru/basic/main.go)
 - [HTTP middleware (RU)](examples/ru/middleware/main.go)
+
+## Field Reference
+
+See [docs/FIELDS.md](docs/FIELDS.md) for all entry fields with descriptions.
 
 ## License
 
