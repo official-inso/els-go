@@ -4,6 +4,19 @@ High-performance Go SDK for [Error Logs Service](https://github.com/official-ins
 
 [Русская версия](README_RU.md)
 
+## What you get
+
+ELS provides a built-in admin dashboard out of the box. All events sent from your Go application appear there with full search, filtering, AI diagnosis, and version-aware regression detection.
+
+| | |
+|---|---|
+| ![Logs list](./docs/screenshots/01-error-logs-list.png) | ![Event detail](./docs/screenshots/02-event-detail-info.png) |
+| Virtual table with facet sidebar (app, env, **version**, source, level, browser, IP, category) | Full event metadata: timestamps, geo, env, **app version**, fingerprint, session |
+| ![AI diagnosis](./docs/screenshots/03-error-detail-ai.png) | ![Analytics](./docs/screenshots/04-analytics-dashboard.png) |
+| Stack trace + AI diagnosis (what broke, where, how to fix) | Dashboard with timeline, donuts, **version regressions** widget |
+| ![API keys](./docs/screenshots/05-api-keys.png) | ![Favorites](./docs/screenshots/07-favorites.png) |
+| Scoped API keys (write/read/read-any), live/test envs, rotation | Bookmarks for trace IDs that survive across sessions |
+
 ## Install
 
 ```bash
@@ -29,6 +42,7 @@ func main() {
         APIKey:        "your-api-key",
         AppSlug:       "my-service",
         DeploymentEnv: "PRODUCTION",
+        AppVersion:    os.Getenv("BUILD_VERSION"), // see "Versioning" below
     })
     defer els.Close()
 
@@ -188,6 +202,47 @@ if els.IsRetryableErr(err) {
 
 ---
 
+## Versioning
+
+The `AppVersion` field powers ELS analytics for **regression detection** ("which errors first appeared in the latest release") and version-aware timelines.
+
+ELS accepts **any string up to 128 characters** and auto-detects the format:
+
+| Type | Examples |
+|---|---|
+| `date-compact` | `20260507120000` |
+| `semver` | `1.2.3`, `1.0.0-rc.1`, `2.0.0+build.123` |
+| `calver` | `2026.05`, `26.05.07` |
+| `date-iso` | `2026-05-07`, `2026-05-07T12:00:00Z` |
+| `git-sha` | `a1b2c3d`, `a1b2c3d4e5f6...` |
+| `prefixed` | `v1.2.3`, `release-2026.05` |
+| `opaque` | `production`, `nightly`, `customLabel` |
+
+**Recommended setup**: pass build time via Dockerfile + CI:
+
+```dockerfile
+ARG BUILD_VERSION=dev
+ENV BUILD_VERSION=$BUILD_VERSION
+```
+
+```yaml
+# .gitlab-ci.yml
+- export BUILD_VERSION=$(date -u +%Y%m%d%H%M%S)
+- docker build --build-arg BUILD_VERSION="$BUILD_VERSION" ...
+```
+
+```go
+els.Init(els.Config{ ..., AppVersion: os.Getenv("BUILD_VERSION") })
+```
+
+**Per-call override**: use `els.WithAppVersion(...)` to override per `Capture` call:
+
+```go
+els.CaptureErrorGlobal(err, els.WithAppVersion("client-app-v3"), els.WithMeta(map[string]any{...}))
+```
+
+---
+
 ## Configuration
 
 ```go
@@ -200,6 +255,7 @@ els.Config{
     AppSlug       string // Application identifier
     DeploymentEnv string // DEV, STAGING, PRODUCTION
     ServiceName   string // Microservice name
+    AppVersion    string // App version (any format up to 128 chars, see Versioning)
 
     // Batching
     BatchSize     int           // Max entries per request (default: 50)

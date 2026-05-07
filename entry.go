@@ -68,6 +68,10 @@ type ErrorEntry struct {
 	// SessionID groups errors from the same logical session (auto-generated).
 	SessionID string `json:"sessionId,omitempty"`
 
+	// AppVersion is the version of the application sending this log entry.
+	// Opaque string of any format (set from Config.AppVersion if empty).
+	AppVersion string `json:"appVersion,omitempty"`
+
 	// Meta holds arbitrary key-value metadata.
 	Meta map[string]any `json:"meta,omitempty"`
 }

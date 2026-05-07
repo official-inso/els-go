@@ -57,3 +57,10 @@ func WithReferrer(ref string) CaptureOption {
 func WithComponentStack(cs string) CaptureOption {
 	return func(e *ErrorEntry) { e.ComponentStack = cs }
 }
+
+// WithAppVersion overrides the configured app version for this entry.
+// Useful when a single process logs on behalf of multiple versions
+// (e.g. proxying logs from different client builds).
+func WithAppVersion(v string) CaptureOption {
+	return func(e *ErrorEntry) { e.AppVersion = v }
+}

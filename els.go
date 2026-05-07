@@ -33,6 +33,13 @@ type Config struct {
 	// ServiceName identifies the specific microservice.
 	ServiceName string
 
+	// AppVersion is the version of the application sending logs. Any string
+	// up to 128 chars is accepted: semver ("1.2.3"), CalVer ("2026.05.07"),
+	// date-compact ("20260507120000"), git SHA, prefixed ("v1.2.3"), opaque.
+	// ELS analytics auto-detects the format and sorts versions in timeline.
+	// Recommended: pass `os.Getenv("BUILD_VERSION")` set by your build pipeline.
+	AppVersion string
+
 	// BatchSize is the maximum number of entries per batch request.
 	// Default: 50.
 	BatchSize int
@@ -448,6 +455,9 @@ func (c *Client) enrichDefaults(entry *ErrorEntry) {
 	}
 	if entry.ServiceName == "" {
 		entry.ServiceName = c.config.ServiceName
+	}
+	if entry.AppVersion == "" {
+		entry.AppVersion = c.config.AppVersion
 	}
 }
 
