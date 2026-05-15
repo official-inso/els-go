@@ -10,11 +10,11 @@ ELS provides a built-in admin dashboard out of the box. All events sent from you
 
 | | |
 |---|---|
-| ![Logs list](./docs/screenshots/01-error-logs-list.png) | ![Event detail](./docs/screenshots/02-event-detail-info.png) |
+| ![Logs list](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/01-error-logs-list.png) | ![Event detail](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/02-event-detail-info.png) |
 | Virtual table with facet sidebar (app, env, **version**, source, level, browser, IP, category) | Full event metadata: timestamps, geo, env, **app version**, fingerprint, session |
-| ![AI diagnosis](./docs/screenshots/03-error-detail-ai.png) | ![Analytics](./docs/screenshots/04-analytics-dashboard.png) |
+| ![AI diagnosis](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/03-error-detail-ai.png) | ![Analytics](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/04-analytics-dashboard.png) |
 | Stack trace + AI diagnosis (what broke, where, how to fix) | Dashboard with timeline, donuts, **version regressions** widget |
-| ![API keys](./docs/screenshots/05-api-keys.png) | ![Favorites](./docs/screenshots/07-favorites.png) |
+| ![API keys](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/05-api-keys.png) | ![Favorites](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/07-favorites.png) |
 | Scoped API keys (write/read/read-any), live/test envs, rotation | Bookmarks for trace IDs that survive across sessions |
 
 ## Install
