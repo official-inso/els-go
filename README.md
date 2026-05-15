@@ -2,20 +2,17 @@
 
 High-performance Go SDK for [Error Logs Service](https://github.com/official-inso/els-go). Zero dependencies, async batching, disk buffering.
 
-[Русская версия](README_RU.md)
+> 🇷🇺 [Русская версия → README_RU.md](README_RU.md) &nbsp;•&nbsp; 📚 [SDKs overview → ../README.md](../README.md)
 
 ## What you get
 
-ELS provides a built-in admin dashboard out of the box. All events sent from your Go application appear there with full search, filtering, AI diagnosis, and version-aware regression detection.
+Every event lands in the built-in dashboard with full-text search, faceted filtering, AI-assisted diagnosis, and a regressions-by-version widget.
 
-| | |
-|---|---|
-| ![Logs list](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/01-error-logs-list.png) | ![Event detail](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/02-event-detail-info.png) |
-| Virtual table with facet sidebar (app, env, **version**, source, level, browser, IP, category) | Full event metadata: timestamps, geo, env, **app version**, fingerprint, session |
-| ![AI diagnosis](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/03-error-detail-ai.png) | ![Analytics](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/04-analytics-dashboard.png) |
-| Stack trace + AI diagnosis (what broke, where, how to fix) | Dashboard with timeline, donuts, **version regressions** widget |
-| ![API keys](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/05-api-keys.png) | ![Favorites](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/07-favorites.png) |
-| Scoped API keys (write/read/read-any), live/test envs, rotation | Bookmarks for trace IDs that survive across sessions |
+![ELS dashboard preview](https://raw.githubusercontent.com/official-inso/els-go/main/docs/screenshots/01-error-logs-list.png)
+
+→ **[Full UI tour with all 4 screenshots](../README.md#what-you-get)**
+
+Don't have an API key yet? **[Sign up at lk.insoweb.ru](https://lk.insoweb.ru)** — takes under a minute.
 
 ## Install
 
@@ -300,6 +297,159 @@ defer client.Close() // or defer els.Close() for global
 
 ---
 
+## Migration
+
+### From go.uber.org/zap
+
+**Before:**
+
+```go
+import "go.uber.org/zap"
+
+logger, _ := zap.NewProduction()
+defer logger.Sync()
+
+logger.Info("user logged in", zap.Int("userId", 42))
+logger.Error("payment failed", zap.Error(err))
+```
+
+**After:**
+
+```go
+import els "github.com/official-inso/els-go"
+
+els.Init(els.Config{
+    Endpoint:      "https://api.insoweb.ru/els",
+    APIKey:        os.Getenv("ELS_API_KEY"),
+    AppSlug:       "my-service",
+    DeploymentEnv: "PRODUCTION",
+    AppVersion:    os.Getenv("BUILD_VERSION"),
+})
+defer els.Close()
+
+els.CaptureMessageGlobal("user logged in", els.LevelInfo,
+    els.WithMeta(map[string]any{"userId": 42}))
+els.CaptureErrorGlobal(err, els.WithURL("/api/pay"))
+```
+
+| zap | ELS | Notes |
+|---|---|---|
+| `zap.NewProduction()` | `els.Init(els.Config{...})` | Once at startup |
+| `logger.Info(msg, zap.X(...))` | `els.CaptureMessageGlobal(msg, level, els.WithMeta(...))` | Or use `els.SlogHandler` for `log/slog` idioms |
+| `zap.Error(err)` | `els.CaptureErrorGlobal(err, ...)` | Dedicated path for errors |
+| `logger.With(fields)` | `els.WithMeta(...)` per call | Or build a wrapper that pre-bakes meta |
+| `logger.Sugar()` | Not provided | Stay structured |
+| Sampling | `Config.SampleRate` | Same idea |
+
+**Gotchas:**
+
+- zap's encoder choices (`console`, `json`) are not exposed — the wire format is fixed JSON.
+- For drop-in compatibility, prefer the `slog` integration (see Features) — zap's structured calls map naturally.
+
+---
+
+### From sirupsen/logrus
+
+**Before:**
+
+```go
+import "github.com/sirupsen/logrus"
+
+log := logrus.New()
+log.SetFormatter(&logrus.JSONFormatter{})
+log.SetLevel(logrus.InfoLevel)
+
+log.WithFields(logrus.Fields{"userId": 42}).Info("user logged in")
+log.WithError(err).Error("payment failed")
+```
+
+**After:**
+
+```go
+import els "github.com/official-inso/els-go"
+
+els.Init(els.Config{
+    Endpoint:   "https://api.insoweb.ru/els",
+    APIKey:     os.Getenv("ELS_API_KEY"),
+    AppSlug:    "my-service",
+    MinLevel:   "info",
+})
+defer els.Close()
+
+els.CaptureMessageGlobal("user logged in", els.LevelInfo,
+    els.WithMeta(map[string]any{"userId": 42}))
+els.CaptureErrorGlobal(err, els.WithURL("/api/pay"))
+```
+
+| logrus | ELS | Notes |
+|---|---|---|
+| `logrus.New()` | `els.Init(els.Config{...})` | Single global or instance |
+| `WithFields(Fields{...})` | `els.WithMeta(map[string]any{...})` | Same shape |
+| `WithError(err)` | `els.CaptureErrorGlobal(err)` | Dedicated path |
+| `SetLevel` | `Config.MinLevel` | Same idea |
+| Hooks (`AddHook`) | `Config.BeforeSend` | Same role |
+| Text formatter | Not provided | JSON only on the wire |
+
+**Gotchas:**
+
+- logrus is in maintenance mode. ELS aligns with modern `log/slog` — see Features for a structured handler.
+- `logrus.PanicLevel` ≈ ELS `LevelCritical`; the SDK does not panic by itself.
+
+---
+
+### From log/slog (standard library)
+
+`log/slog` integrates natively — no migration needed beyond pointing the handler at ELS.
+
+**Before:**
+
+```go
+import "log/slog"
+import "os"
+
+logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+slog.SetDefault(logger)
+
+slog.Info("user logged in", "userId", 42)
+slog.Error("payment failed", "err", err)
+```
+
+**After:**
+
+```go
+import (
+    "log/slog"
+    els "github.com/official-inso/els-go"
+)
+
+client, _ := els.New(els.Config{
+    Endpoint: "https://api.insoweb.ru/els",
+    APIKey:   os.Getenv("ELS_API_KEY"),
+    AppSlug:  "my-service",
+})
+defer client.Close()
+
+logger := slog.New(els.SlogHandler(client, nil))
+slog.SetDefault(logger)
+
+slog.Info("user logged in", "userId", 42)
+slog.Error("payment failed", "err", err)
+```
+
+| `log/slog` | ELS | Notes |
+|---|---|---|
+| `slog.NewJSONHandler(os.Stderr, nil)` | `els.SlogHandler(client, nil)` | Same handler contract |
+| `slog.Info("msg", "k", v)` | unchanged | Routed to ELS as `info` event |
+| `slog.With(...)` | unchanged | Adds key/value pairs to `meta` |
+| Two destinations (stdout + ELS) | Compose multiple handlers | Wrap both via a fan-out handler |
+
+**Gotchas:**
+
+- The default level is `INFO`. Set `MinLevel` if you need to capture `DEBUG`.
+- Stack traces from `slog.Error("msg", "err", err)` arrive as `meta.err` — to ship the full stack, use `els.CaptureError(err, ...)` directly for the error path.
+
+---
+
 ## Examples
 
 - [Basic usage (EN)](examples/en/basic/main.go) — init, capture, sync send, health check
@@ -310,6 +460,52 @@ defer client.Close() // or defer els.Close() for global
 ## Field Reference
 
 See [docs/FIELDS.md](docs/FIELDS.md) for all entry fields with descriptions.
+
+## Why ELS
+
+ELS for Go is a focused logging SaaS, not a full observability suite. It optimises for capture speed, AI-driven triage, and a low integration cost.
+
+- **Lower weight.** Single module, zero external dependencies.
+- **Zero external API calls.** Only `POST /errors[/batch]` and `GET /health`.
+- **AI-assisted diagnosis** on every stack trace, out of the box.
+- **5-minute integration.** `go get` + `els.Init(...)` and you're done.
+- **Predictable price.** Tariffs live in your personal cabinet.
+
+| Feature | ELS | Sentry | Datadog | Loki | LogRocket |
+|---|---|---|---|---|---|
+| AI on stack traces | Built-in | Paid add-on | Paid add-on | None | None |
+| Zero-dep SDK | Yes | No | No | No | No |
+| Free tier retention | 24h | 30d (limited) | Trial only | Self-cost | 3–30d |
+| Setup time | ~5 min | 10–20 min | 30–60 min | Hours | 10–20 min |
+
+ELS does **not** ship full APM / tracing, source-map upload, session replay, frontend RUM, or infra metrics. Pair ELS with Grafana / Datadog or stay on Sentry if you need them.
+
+→ **Sign up at [lk.insoweb.ru](https://lk.insoweb.ru)** to grab an API key.
+
+## Other ELS SDKs
+
+Same wire format, same dashboard — pick by stack.
+
+**Go** (this repo)
+- `github.com/official-inso/els-go` — core SDK with `slog` handler, HTTP middleware
+
+**Node.js family**
+- [`@inso_web/els-client`](../js/README.md) — base TS / Node / browser client
+- [`@inso_web/els-express`](../express/README.md) — Express middleware
+- [`@inso_web/els-next`](../next/README.md) — Next.js helpers
+- [`@inso_web/els-nest`](../nest/README.md) — NestJS module
+- [`@inso_web/els-react`](../react/README.md) — React Provider, hooks, ErrorBoundary
+- [`@inso_web/els-vue`](../vue/README.md) — Vue 3 plugin
+
+**Other stacks**
+- [`Inso.Els`](../csharp/README.md) — .NET (Core + ASP.NET Core + ILogger)
+- [`io.github.official-inso:els-core`](../java/README.md) — Java + Spring Boot starter + SLF4J
+
+→ **Full overview & comparison:** [../README.md](../README.md) · [github.com/official-inso/els-go/blob/main/sdks/README.md](https://github.com/official-inso/els-go/blob/main/sdks/README.md)
+
+## Pricing
+
+Free tier — **24-hour log retention**. See **[lk.insoweb.ru](https://lk.insoweb.ru)** for the full tariff matrix.
 
 ## License
 
