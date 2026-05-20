@@ -1,6 +1,97 @@
 package els
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+	"time"
+)
+
+// ctxKey is a private type for context keys to avoid collisions.
+type ctxKey int
+
+const (
+	ctxKeyRequestID ctxKey = iota
+	ctxKeyTraceID
+)
+
+// ContextWithRequestID returns a context carrying a request ID that the
+// Capture*Ctx methods attach to entries as Meta["requestId"].
+func ContextWithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ctxKeyRequestID, id)
+}
+
+// ContextWithTraceID returns a context carrying a trace ID that the
+// Capture*Ctx methods attach to entries as Meta["traceId"].
+func ContextWithTraceID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ctxKeyTraceID, id)
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(ctxKeyRequestID).(string)
+	return v
+}
+
+func traceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(ctxKeyTraceID).(string)
+	return v
+}
+
+// ctxOption builds a CaptureOption that copies request/trace IDs from ctx into
+// the entry's Meta.
+func ctxOption(ctx context.Context) CaptureOption {
+	return func(e *ErrorEntry) {
+		rid := requestIDFromContext(ctx)
+		tid := traceIDFromContext(ctx)
+		if rid == "" && tid == "" {
+			return
+		}
+		if e.Meta == nil {
+			e.Meta = make(map[string]any)
+		}
+		if rid != "" {
+			e.Meta["requestId"] = rid
+		}
+		if tid != "" {
+			e.Meta["traceId"] = tid
+		}
+	}
+}
+
+// CaptureErrorCtx is like CaptureError but also copies request/trace IDs from
+// ctx (set via ContextWithRequestID / ContextWithTraceID) into the entry.
+func (c *Client) CaptureErrorCtx(ctx context.Context, err error, opts ...CaptureOption) {
+	if err == nil {
+		return
+	}
+	entry := &ErrorEntry{
+		Message:   err.Error(),
+		Stack:     captureStack(3),
+		Level:     c.config.DefaultLevel,
+		Source:    c.config.DefaultSource,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		SessionID: c.SessionID(),
+	}
+	ctxOption(ctx)(entry)
+	for _, opt := range opts {
+		opt(entry)
+	}
+	c.enqueue(entry)
+}
+
+// CaptureMessageCtx is like CaptureMessage but also copies request/trace IDs
+// from ctx into the entry.
+func (c *Client) CaptureMessageCtx(ctx context.Context, msg string, level Level, opts ...CaptureOption) {
+	all := make([]CaptureOption, 0, len(opts)+1)
+	all = append(all, ctxOption(ctx))
+	all = append(all, opts...)
+	c.CaptureMessage(msg, level, all...)
+}
 
 // UserContext holds information about the current user.
 // When set via SetUser, it is automatically attached to all captured entries via Meta.

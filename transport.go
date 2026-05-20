@@ -26,7 +26,7 @@ func newHTTPTransport(config Config) *httpTransport {
 		httpClient = &http.Client{Timeout: config.Timeout}
 	}
 	return &httpTransport{
-		endpoint:   config.Endpoint,
+		endpoint:   config.endpoint,
 		apiKey:     config.APIKey,
 		httpClient: httpClient,
 		maxRetries: config.MaxRetries,
@@ -36,7 +36,7 @@ func newHTTPTransport(config Config) *httpTransport {
 
 // sendBatch sends a batch of entries to the ELS API.
 // Returns nil on success, a *SendError on failure.
-func (t *httpTransport) sendBatch(ctx context.Context, entries []ErrorEntry) error {
+func (t *httpTransport) sendBatch(ctx context.Context, entries []*ErrorEntry) error {
 	payload, err := json.Marshal(batchRequest{Errors: entries})
 	if err != nil {
 		return newPermanentError(0, fmt.Errorf("marshal: %w", err))
@@ -51,6 +51,27 @@ func (t *httpTransport) sendSingle(ctx context.Context, entry ErrorEntry) error 
 		return newPermanentError(0, fmt.Errorf("marshal: %w", err))
 	}
 	return t.doWithRetry(ctx, "/errors", payload)
+}
+
+// health performs a GET /health connectivity check.
+func (t *httpTransport) health(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.endpoint+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("els: create health request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+t.apiKey)
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("els: health check failed: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("els: health check returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // doWithRetry performs an HTTP POST with retry logic.
@@ -81,12 +102,16 @@ func (t *httpTransport) doWithRetry(ctx context.Context, path string, payload []
 			continue
 		}
 
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-
+		// Success: drain body (for keep-alive reuse) without allocating it.
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 			return nil
 		}
+
+		// Non-2xx: read body for the error message.
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 
 		// Rate limited — respect Retry-After header
 		if resp.StatusCode == 429 && attempt < t.maxRetries {

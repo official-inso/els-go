@@ -11,7 +11,6 @@ import (
 
 func ExampleNew() {
 	client, err := els.New(els.Config{
-		Endpoint:      "https://api.example.com/els",
 		APIKey:        "your-api-key",
 		AppSlug:       "my-service",
 		DeploymentEnv: "PRODUCTION",
@@ -27,8 +26,7 @@ func ExampleNew() {
 
 func ExampleClient_CaptureError() {
 	client, _ := els.New(els.Config{
-		Endpoint: "https://api.example.com/els",
-		APIKey:   "key",
+		APIKey: "key",
 	})
 	defer client.Close()
 
@@ -43,8 +41,7 @@ func ExampleClient_CaptureError() {
 
 func ExampleClient_SendSync() {
 	client, _ := els.New(els.Config{
-		Endpoint: "https://api.example.com/els",
-		APIKey:   "key",
+		APIKey: "key",
 	})
 	defer client.Close()
 
@@ -61,8 +58,7 @@ func ExampleClient_SendSync() {
 
 func ExampleClient_Middleware() {
 	client, _ := els.New(els.Config{
-		Endpoint: "https://api.example.com/els",
-		APIKey:   "key",
+		APIKey: "key",
 	})
 	defer client.Close()
 
@@ -77,8 +73,7 @@ func ExampleClient_Middleware() {
 
 func ExampleClient_Health() {
 	client, _ := els.New(els.Config{
-		Endpoint: "https://api.example.com/els",
-		APIKey:   "key",
+		APIKey: "key",
 	})
 	defer client.Close()
 

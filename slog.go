@@ -7,20 +7,31 @@ import (
 	"strconv"
 )
 
-// SlogHandler returns a slog.Handler that sends log records to ELS.
-// Use this to integrate ELS with Go's standard structured logging.
+// SlogHandler returns a slog.Handler that forwards log records to ELS, so an
+// existing log/slog setup reports to ELS with no call-site changes. Pass nil
+// for sensible defaults (AddSource and CaptureStackOnError enabled).
 //
 //	logger := slog.New(els.SlogHandler(client, nil))
 //	slog.SetDefault(logger)
 //
-//	slog.Error("database timeout", "db", "postgres", "latency_ms", 5000)
-//	// → captured as ELS error with meta: {"db": "postgres", "latency_ms": 5000}
+//	slog.Info("cache warm", "keys", 1280)
+//	// A record carrying an error attribute (key "err"/"error") is captured WITH
+//	// a full stack trace and the error text in Meta — just like CaptureError:
+//	slog.Error("db query failed", "err", dbErr, "table", "users")
 //
-// The handler respects MinLevel from ELS config. Pass a custom slog.HandlerOptions
-// to further configure behavior (e.g., add source location).
+// Record attributes become entry Meta. The handler respects Config.MinLevel,
+// and ServiceName/AppSlug/etc. are filled from Config automatically. Configure
+// behavior via SlogHandlerOptions.
 func SlogHandler(client *Client, opts *SlogHandlerOptions) slog.Handler {
 	if opts == nil {
-		opts = &SlogHandlerOptions{}
+		// Sensible defaults when no options are provided.
+		opts = &SlogHandlerOptions{
+			AddSource:           true,
+			CaptureStackOnError: true,
+		}
+	}
+	if len(opts.ErrorKeys) == 0 {
+		opts.ErrorKeys = []string{"err", "error"}
 	}
 	return &elsSlogHandler{
 		client: client,
@@ -37,6 +48,17 @@ type SlogHandlerOptions struct {
 	// URL is the default URL attached to entries when none is provided via attributes.
 	// Default: "slog".
 	URL string
+
+	// ErrorKeys lists the attribute keys whose value, when it is an error,
+	// is treated as the cause of the log record. The handler then captures a
+	// full stack trace (like CaptureError) and stores the error text in Meta.
+	// Default: {"err", "error"}.
+	ErrorKeys []string
+
+	// CaptureStackOnError, when true, attaches a full stack trace to records
+	// that carry an error attribute or whose level is >= error.
+	// Default: true.
+	CaptureStackOnError bool
 }
 
 type elsSlogHandler struct {
@@ -67,32 +89,48 @@ func (h *elsSlogHandler) Handle(_ context.Context, record slog.Record) error {
 		entry.URL = "slog"
 	}
 
-	// Add source location
-	if h.opts.AddSource {
-		if record.PC != 0 {
-			fs := runtime.CallersFrames([]uintptr{record.PC})
-			f, _ := fs.Next()
-			if f.File != "" {
-				entry.Stack = f.Function + "\n\t" + f.File + ":" + strconv.Itoa(f.Line) + "\n"
+	// Collect attributes into Meta and detect an error-valued attribute.
+	meta := make(map[string]any)
+	var capturedErr error
+
+	collect := func(a slog.Attr) {
+		prefix := groupPrefix(h.groups)
+		v := a.Value.Any()
+		meta[prefix+a.Key] = v
+		if capturedErr == nil {
+			if err, ok := v.(error); ok && h.isErrorKey(a.Key) {
+				capturedErr = err
 			}
 		}
 	}
 
-	// Collect attributes into Meta
-	meta := make(map[string]any)
-
-	// Pre-existing attrs from WithAttrs
+	// Pre-existing attrs from WithAttrs, then record-level attrs.
 	for _, a := range h.attrs {
-		prefix := groupPrefix(h.groups)
-		meta[prefix+a.Key] = a.Value.Any()
+		collect(a)
 	}
-
-	// Record-level attrs
 	record.Attrs(func(a slog.Attr) bool {
-		prefix := groupPrefix(h.groups)
-		meta[prefix+a.Key] = a.Value.Any()
+		collect(a)
 		return true
 	})
+
+	// Route error-carrying records like CaptureError: full stack + error text.
+	isError := capturedErr != nil || level.Priority() >= LevelError.Priority()
+	if capturedErr != nil {
+		meta["error"] = capturedErr.Error()
+	}
+
+	switch {
+	case h.opts.CaptureStackOnError && isError:
+		// Full multi-frame stack (skips runtime.Callers + this frame).
+		entry.Stack = captureStack(3)
+	case h.opts.AddSource && record.PC != 0:
+		// Single source frame for non-error records.
+		fs := runtime.CallersFrames([]uintptr{record.PC})
+		f, _ := fs.Next()
+		if f.File != "" {
+			entry.Stack = f.Function + "\n\t" + f.File + ":" + strconv.Itoa(f.Line) + "\n"
+		}
+	}
 
 	if len(meta) > 0 {
 		entry.Meta = meta
@@ -100,6 +138,16 @@ func (h *elsSlogHandler) Handle(_ context.Context, record slog.Record) error {
 
 	h.client.enqueue(entry)
 	return nil
+}
+
+// isErrorKey reports whether key is configured as an error-carrying attribute.
+func (h *elsSlogHandler) isErrorKey(key string) bool {
+	for _, k := range h.opts.ErrorKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *elsSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -126,7 +174,12 @@ func (h *elsSlogHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-func slogLevelToELS(level slog.Level) string {
+func slogLevelToELS(level slog.Level) Level {
+	return LevelFromSlog(level)
+}
+
+// LevelFromSlog maps a slog.Level to the corresponding ELS Level.
+func LevelFromSlog(level slog.Level) Level {
 	switch {
 	case level >= slog.LevelError:
 		return LevelError
@@ -136,6 +189,20 @@ func slogLevelToELS(level slog.Level) string {
 		return LevelInfo
 	default:
 		return LevelDebug
+	}
+}
+
+// ToSlog maps an ELS Level back to the nearest slog.Level.
+func (l Level) ToSlog() slog.Level {
+	switch l {
+	case LevelCritical, LevelError:
+		return slog.LevelError
+	case LevelWarning:
+		return slog.LevelWarn
+	case LevelInfo:
+		return slog.LevelInfo
+	default:
+		return slog.LevelDebug
 	}
 }
 

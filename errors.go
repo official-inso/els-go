@@ -1,6 +1,9 @@
 package els
 
-import "fmt"
+import (
+	stderrors "errors"
+	"fmt"
+)
 
 // SendError represents an error returned by the ELS API during send operations.
 // It distinguishes between retryable (server/network) and permanent (client) errors.
@@ -37,41 +40,26 @@ func newPermanentError(statusCode int, err error) *SendError {
 	return &SendError{StatusCode: statusCode, IsRetryable: false, Err: err}
 }
 
-// IsRetryableErr returns true if the error is a retryable SendError.
+// IsRetryableErr reports whether err (or any error it wraps) is a retryable
+// *SendError — i.e. a transient failure (5xx, 429, or a network error) that is
+// safe to retry. Returns false for permanent client errors (4xx except 429) and
+// for non-ELS errors.
+//
+//	if err := client.SendSync(ctx, myErr); err != nil {
+//	    if els.IsRetryableErr(err) {
+//	        // transient — safe to retry
+//	    }
+//	}
 func IsRetryableErr(err error) bool {
 	var se *SendError
-	if As(err, &se) {
+	if stderrors.As(err, &se) {
 		return se.IsRetryable
 	}
 	return false
 }
 
-// As is a convenience re-export of errors.As for use with SendError.
-func As(err error, target interface{}) bool {
-	type asInterface interface {
-		As(interface{}) bool
-	}
-	// Walk the error chain
-	for err != nil {
-		if se, ok := target.(**SendError); ok {
-			if v, ok2 := err.(*SendError); ok2 {
-				*se = v
-				return true
-			}
-		}
-		if x, ok := err.(asInterface); ok {
-			if x.As(target) {
-				return true
-			}
-		}
-		type unwrapper interface {
-			Unwrap() error
-		}
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
+// As is a thin convenience wrapper around the standard library's errors.As,
+// kept for backward compatibility. Prefer errors.As directly in new code.
+func As(err error, target any) bool {
+	return stderrors.As(err, target)
 }

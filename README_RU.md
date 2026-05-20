@@ -31,28 +31,32 @@ package main
 import (
     "errors"
     "log"
+    "os"
 
     els "github.com/official-inso/els-go"
 )
 
 func main() {
     // Вариант A: глобальный клиент (рекомендуется для большинства приложений)
-    els.Init(els.Config{
-        Endpoint:      "https://api.example.com/els",
-        APIKey:        "ваш-api-ключ",
+    if err := els.Init(els.Config{
+        // Endpoint захардкожен в SDK — указывать не нужно.
+        APIKey:        os.Getenv("ELS_API_KEY"),
         AppSlug:       "my-service",
         DeploymentEnv: "PRODUCTION",
-    })
+    }); err != nil {
+        log.Fatal(err)
+    }
     defer els.Close()
 
     els.CaptureErrorGlobal(errors.New("что-то сломалось"), els.WithURL("/api/users"))
+}
 
-    // Вариант B: явный клиент (для библиотек или нескольких экземпляров)
-    client, err := els.New(els.Config{...})
-    if err != nil { log.Fatal(err) }
-    defer client.Close()
-
-    client.CaptureError(errors.New("таймаут БД"), els.WithURL("/api/data"))
+// Вариант B: явный клиент (для библиотек или нескольких экземпляров)
+func newClient() (*els.Client, error) {
+    return els.New(els.Config{
+        APIKey:  os.Getenv("ELS_API_KEY"),
+        AppSlug: "my-service",
+    })
 }
 ```
 
@@ -94,7 +98,34 @@ client.CaptureError(err,
 )
 ```
 
-Полный список: `WithURL`, `WithLevel`, `WithSource`, `WithStack`, `WithMeta`, `WithUserAgent`, `WithLanguage`, `WithReferrer`, `WithSessionID`, `WithServiceName`, `WithComponentStack`, `WithRequest`, `WithCause`.
+Полный список: `WithURL`, `WithLevel`, `WithSource`, `WithStack`, `WithMeta`, `WithUserAgent`, `WithLanguage`, `WithReferrer`, `WithSessionID`, `WithServiceName`, `WithComponentStack`, `WithAppVersion`, `WithRequest`, `WithCause`.
+
+### Шорткаты уровней
+
+Логгер-стиль для сообщений — тонкие обёртки над `CaptureMessage`:
+
+```go
+client.Debug("кэш прогрет")
+client.Info("пользователь вошёл", els.WithMeta(map[string]any{"userId": 42}))
+client.Warning("бюджет ретраев на исходе")
+client.Error("валидация не прошла")   // *сообщение* уровня error
+client.Critical("диск заполнен")
+```
+
+> `client.Error(msg string)` пишет сообщение. Чтобы захватить Go-`error`
+> **со стек-трейсом**, используйте `client.CaptureError(err)`.
+
+### Проброс контекста
+
+Пронесите request/trace ID через `context.Context` — он добавится автоматически:
+
+```go
+ctx = els.ContextWithRequestID(ctx, "req-123")
+ctx = els.ContextWithTraceID(ctx, "trace-abc")
+
+client.CaptureErrorCtx(ctx, err, els.WithURL("/api"))   // в Meta попадут requestId + traceId
+client.CaptureMessageCtx(ctx, "шаг выполнен", els.LevelInfo)
+```
 
 ---
 
@@ -130,14 +161,29 @@ client.SetUser(&els.UserContext{
 
 ### Интеграция с slog
 
-Направление стандартного `log/slog` в ELS:
+Направление стандартного `log/slog` в ELS без изменения мест вызова:
 
 ```go
 logger := slog.New(els.SlogHandler(client, nil))
 slog.SetDefault(logger)
 
-slog.Error("таймаут БД", "host", "pg-1", "latency_ms", 5200)
-// → захвачено как ошибка ELS с meta: {"host": "pg-1", "latency_ms": 5200}
+slog.Info("кэш прогрет", "keys", 1280) // атрибуты → Meta записи
+
+// Запись с атрибутом-ошибкой ("err"/"error") уходит СО полным стек-трейсом
+// и текстом ошибки в Meta — как CaptureError:
+slog.Error("сбой запроса к БД", "err", dbErr, "table", "users")
+```
+
+`ServiceName`/`AppSlug` из `Config` добавляются автоматически. Настройка через
+`SlogHandlerOptions`:
+
+```go
+els.SlogHandler(client, &els.SlogHandlerOptions{
+    AddSource:           true,                     // file:line для не-error записей
+    CaptureStackOnError: true,                     // полный стек на error (по умолчанию)
+    ErrorKeys:           []string{"err", "error"}, // атрибуты-причины
+    URL:                 "slog",                   // URL по умолчанию
+})
 ```
 
 ### Семплирование
@@ -206,8 +252,7 @@ if els.IsRetryableErr(err) {
 ```go
 els.Config{
     // Обязательные
-    Endpoint string    // Базовый URL ELS API
-    APIKey   string    // API-ключ
+    APIKey string // API-ключ (endpoint захардкожен в SDK)
 
     // Идентификация (рекомендуется)
     AppSlug       string // Идентификатор приложения
@@ -220,7 +265,7 @@ els.Config{
     BufferSize    int           // Ёмкость очереди (по умолчанию: 1000)
 
     // Ретраи
-    MaxRetries     int           // Попытки (по умолчанию: 3)
+    MaxRetries     int           // Попытки (по умолчанию: 3; -1 отключает ретраи)
     RetryBaseDelay time.Duration // Начальная задержка (по умолчанию: 1s)
     Timeout        time.Duration // HTTP таймаут (по умолчанию: 10s)
 
@@ -229,8 +274,11 @@ els.Config{
     MaxBufferFileSize int64  // Макс. размер файла (по умолчанию: 100MB)
 
     // Фильтрация
-    MinLevel   string  // Минимальный уровень (по умолчанию: все)
-    SampleRate float64 // 0.0-1.0, critical всегда проходит (по умолчанию: 1.0)
+    MinLevel   els.Level // Минимальный уровень (по умолчанию: все)
+    SampleRate float64   // 0.0-1.0, critical всегда проходит (по умолчанию: 1.0)
+
+    // Пропускная способность
+    SenderConcurrency int // Параллельных sender-горутин (по умолчанию: 4)
 
     // Хуки
     BeforeSend func(*ErrorEntry) *ErrorEntry // Фильтрация/мутация
@@ -239,7 +287,7 @@ els.Config{
     // Расширенные
     HTTPClient    *http.Client  // Свой HTTP-клиент
     FlushTimeout  time.Duration // Таймаут Flush() (по умолчанию: 10s)
-    DefaultLevel  string        // По умолчанию: "error"
+    DefaultLevel  els.Level     // По умолчанию: "error"
     DefaultSource string        // По умолчанию: "server"
     Debug         bool          // Отладочный вывод
 }
@@ -279,7 +327,6 @@ logger.Error("payment failed", zap.Error(err))
 import els "github.com/official-inso/els-go"
 
 els.Init(els.Config{
-    Endpoint:      "https://api.insoweb.ru/els",
     APIKey:        os.Getenv("ELS_API_KEY"),
     AppSlug:       "my-service",
     DeploymentEnv: "PRODUCTION",
@@ -329,10 +376,9 @@ log.WithError(err).Error("payment failed")
 import els "github.com/official-inso/els-go"
 
 els.Init(els.Config{
-    Endpoint:   "https://api.insoweb.ru/els",
-    APIKey:     os.Getenv("ELS_API_KEY"),
-    AppSlug:    "my-service",
-    MinLevel:   "info",
+    APIKey:   os.Getenv("ELS_API_KEY"),
+    AppSlug:  "my-service",
+    MinLevel: els.LevelInfo,
 })
 defer els.Close()
 
@@ -383,9 +429,8 @@ import (
 )
 
 client, _ := els.New(els.Config{
-    Endpoint: "https://api.insoweb.ru/els",
-    APIKey:   os.Getenv("ELS_API_KEY"),
-    AppSlug:  "my-service",
+    APIKey:  os.Getenv("ELS_API_KEY"),
+    AppSlug: "my-service",
 })
 defer client.Close()
 
@@ -393,6 +438,7 @@ logger := slog.New(els.SlogHandler(client, nil))
 slog.SetDefault(logger)
 
 slog.Info("user logged in", "userId", 42)
+// slog.Error с атрибутом "err" уходит СО полным стек-трейсом, как CaptureError.
 slog.Error("payment failed", "err", err)
 ```
 

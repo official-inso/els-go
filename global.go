@@ -10,19 +10,19 @@ var (
 	globalClient *Client
 )
 
-// Init initializes the global ELS client. After calling Init, you can use
-// package-level functions (CaptureError, CaptureMessage, etc.) without
-// passing the client explicitly. This is the recommended approach for
-// most applications.
+// Init initializes the global ELS client. Afterwards the package-level
+// helpers (CaptureErrorGlobal, CaptureMessageGlobal, SendSyncGlobal,
+// FlushGlobal) work without passing a *Client around — convenient for small
+// services and CLIs. Calling Init again replaces and closes the previous
+// global client.
 //
 //	els.Init(els.Config{
-//	    Endpoint: "https://api.example.com/els",
-//	    APIKey:   "your-key",
-//	    AppSlug:  "my-app",
+//	    APIKey:  "your-key",
+//	    AppSlug: "my-app",
 //	})
 //	defer els.Close()
 //
-//	els.CaptureError(err, els.WithURL("/api"))
+//	els.CaptureErrorGlobal(err, els.WithURL("/api"))
 func Init(config Config) error {
 	c, err := New(config)
 	if err != nil {
@@ -75,7 +75,7 @@ func CaptureErrorGlobal(err error, opts ...CaptureOption) {
 }
 
 // CaptureMessageGlobal captures a message using the global client.
-func CaptureMessageGlobal(msg string, level string, opts ...CaptureOption) {
+func CaptureMessageGlobal(msg string, level Level, opts ...CaptureOption) {
 	globalMu.RLock()
 	c := globalClient
 	globalMu.RUnlock()

@@ -4,7 +4,7 @@ package els
 type CaptureOption func(*ErrorEntry)
 
 // WithLevel sets the severity level of the error entry.
-func WithLevel(level string) CaptureOption {
+func WithLevel(level Level) CaptureOption {
 	return func(e *ErrorEntry) { e.Level = level }
 }
 

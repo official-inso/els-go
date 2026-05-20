@@ -6,3 +6,6 @@
 .idea/
 .els-buffer.jsonl
 vendor/
+
+# compiled example binaries (from `go build`)
+examples/**/els-*

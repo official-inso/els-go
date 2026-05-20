@@ -1,13 +1,49 @@
 package els
 
+// Level is a typed error severity accepted by the ELS API. Use the
+// Level* constants instead of raw strings.
+type Level string
+
 // Level constants represent error severity levels accepted by the ELS API.
 const (
-	LevelCritical = "critical"
-	LevelError    = "error"
-	LevelWarning  = "warning"
-	LevelInfo     = "info"
-	LevelDebug    = "debug"
+	LevelCritical Level = "critical"
+	LevelError    Level = "error"
+	LevelWarning  Level = "warning"
+	LevelInfo     Level = "info"
+	LevelDebug    Level = "debug"
 )
+
+// String returns the wire (JSON) value of the level.
+func (l Level) String() string { return string(l) }
+
+// Valid reports whether l is one of the known ELS levels.
+func (l Level) Valid() bool {
+	switch l {
+	case LevelDebug, LevelInfo, LevelWarning, LevelError, LevelCritical:
+		return true
+	default:
+		return false
+	}
+}
+
+// Priority returns the numeric ordering of the level
+// (debug < info < warning < error < critical). Unknown levels return -1.
+func (l Level) Priority() int {
+	switch l {
+	case LevelDebug:
+		return 0
+	case LevelInfo:
+		return 1
+	case LevelWarning:
+		return 2
+	case LevelError:
+		return 3
+	case LevelCritical:
+		return 4
+	default:
+		return -1
+	}
+}
 
 // Source constants represent the origin of the error.
 const (
@@ -15,13 +51,20 @@ const (
 	SourceServer = "server"
 )
 
-// ErrorEntry represents a single error log entry to be sent to the ELS API.
-// Fields marked as "auto" are filled automatically by the SDK if not provided.
+// ErrorEntry represents a single error log entry sent to the ELS API.
+//
+// Message is the only field you must set. Everything else is optional: the SDK
+// fills sensible defaults (TraceId/Timestamp/SessionID, plus AppSlug,
+// ServiceName, DeploymentEnv and AppVersion from Config) and CaptureError adds
+// a stack trace automatically. Most code never builds an ErrorEntry directly —
+// use CaptureError / CaptureMessage with WithX options instead. Build one
+// explicitly only for CaptureEntry / SendSyncEntry.
 type ErrorEntry struct {
-	// Message is the error text (required).
+	// Message is the error text. This is the only required field.
 	Message string `json:"message"`
 
-	// URL is the request URL or page URL where the error occurred (required).
+	// URL is the request or page URL where the error occurred. Optional;
+	// set it via WithURL or WithRequest, otherwise it is sent empty.
 	URL string `json:"url"`
 
 	// Timestamp in RFC3339 format (auto-filled if empty).
@@ -35,7 +78,7 @@ type ErrorEntry struct {
 
 	// Level is the severity: critical, error, warning, info, debug.
 	// Default: "error".
-	Level string `json:"level"`
+	Level Level `json:"level"`
 
 	// Source indicates origin: "client" or "server". Default: "server".
 	Source string `json:"source"`
@@ -84,5 +127,5 @@ type BatchResult struct {
 
 // batchRequest is the internal request payload for the batch endpoint.
 type batchRequest struct {
-	Errors []ErrorEntry `json:"errors"`
+	Errors []*ErrorEntry `json:"errors"`
 }

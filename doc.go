@@ -5,23 +5,28 @@
 //
 // Key features:
 //   - Zero external dependencies (stdlib only)
-//   - Asynchronous batching with configurable interval and batch size
+//   - Asynchronous batching with a parallel sender pool, so a slow or
+//     unreachable server never blocks ingestion (see Config.SenderConcurrency)
 //   - Synchronous send via SendSync for critical errors requiring confirmation
+//   - Level shortcuts: Debug, Info, Warning, Error, Critical
+//   - log/slog integration (SlogHandler); an slog.Error carrying an "err"
+//     attribute is captured with a full stack trace, like CaptureError
+//   - Context propagation: ContextWithRequestID / ContextWithTraceID +
+//     CaptureErrorCtx / CaptureMessageCtx
 //   - Automatic retry with exponential backoff and 429 rate-limit handling
+//     (set MaxRetries to a negative value to disable retries)
 //   - Typed errors (SendError) distinguishing retryable from permanent failures
 //   - Disk buffer for offline resilience (entries survive process restarts)
-//   - Configurable max buffer file size to prevent unbounded disk usage
+//   - Sampling (SampleRate) — critical entries always pass
 //   - Level filtering via MinLevel to drop low-severity entries
-//   - Graceful shutdown with queue draining
+//   - User context (SetUser) attached to every entry
 //   - net/http middleware for automatic panic recovery (Middleware and RecoverMiddleware)
-//   - Health check endpoint verification
 //   - BeforeSend hook for filtering or mutating entries
-//   - Process-level session ID for correlating related errors
+//   - Graceful shutdown with queue draining; Health check; runtime Stats
 //
 // Quick start:
 //
 //	client, err := els.New(els.Config{
-//	    Endpoint:      "https://api.example.com/els",
 //	    APIKey:        "your-api-key",
 //	    AppSlug:       "my-service",
 //	    DeploymentEnv: "PRODUCTION",

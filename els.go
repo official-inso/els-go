@@ -6,20 +6,35 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
+	"math/rand/v2"
 	"net/http"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// defaultEndpoint — захардкоженный URL ELS. Пользователю указывать не нужно.
+const defaultEndpoint = "https://api.insoweb.ru/els"
+
+// resolveEndpoint всегда возвращает defaultEndpoint. Внутренний
+// (недокументированный) override через env ELS_ENDPOINT — только для тестов
+// и self-hosted-инсталляций, не часть публичного API.
+func resolveEndpoint() string {
+	if v := os.Getenv("ELS_ENDPOINT"); v != "" {
+		return v
+	}
+	return defaultEndpoint
+}
+
 // Config holds the SDK configuration.
 type Config struct {
-	// Endpoint is the base URL of the ELS API (required).
-	// Example: "https://api.example.com/els"
-	Endpoint string
+	// endpoint is hardcoded to the ELS API URL and is not part of the public API.
+	// Internal-only (tests / self-hosted via ELS_ENDPOINT env).
+	endpoint string
 
 	// APIKey is the authentication key for the ELS API (required).
 	APIKey string
@@ -53,7 +68,8 @@ type Config struct {
 	BufferSize int
 
 	// MaxRetries is the number of retry attempts for failed requests.
-	// Default: 3.
+	// Default: 3 (when left unset/zero). Set to a negative value (e.g. -1) to
+	// disable retries entirely.
 	MaxRetries int
 
 	// RetryBaseDelay is the initial delay between retries (doubles each attempt).
@@ -79,7 +95,7 @@ type Config struct {
 	// MinLevel is the minimum severity level to capture. Entries below this level
 	// are silently dropped. Order: debug < info < warning < error < critical.
 	// Default: "" (capture all levels).
-	MinLevel string
+	MinLevel Level
 
 	// BeforeSend is called before each entry is enqueued.
 	// Return nil to drop the entry. Modify the entry in-place to mutate it.
@@ -91,7 +107,7 @@ type Config struct {
 
 	// DefaultLevel is the default severity level for captured entries.
 	// Default: "error".
-	DefaultLevel string
+	DefaultLevel Level
 
 	// DefaultSource is the default source for captured entries.
 	// Default: "server".
@@ -108,6 +124,11 @@ type Config struct {
 	// Default: 1.0.
 	SampleRate float64
 
+	// SenderConcurrency is the number of background goroutines that send
+	// batches in parallel. Higher values keep ingestion flowing even when the
+	// server is slow. Default: 4.
+	SenderConcurrency int
+
 	// Debug enables verbose internal logging to stderr.
 	Debug bool
 }
@@ -122,8 +143,14 @@ func (c *Config) applyDefaults() {
 	if c.BufferSize <= 0 {
 		c.BufferSize = 1000
 	}
-	if c.MaxRetries <= 0 {
+	// MaxRetries: unset (0) → default 3; negative → disable retries (0 retries).
+	if c.MaxRetries == 0 {
 		c.MaxRetries = 3
+	} else if c.MaxRetries < 0 {
+		c.MaxRetries = 0
+	}
+	if c.SenderConcurrency <= 0 {
+		c.SenderConcurrency = 4
 	}
 	if c.RetryBaseDelay <= 0 {
 		c.RetryBaseDelay = time.Second
@@ -143,32 +170,42 @@ func (c *Config) applyDefaults() {
 	if c.DefaultSource == "" {
 		c.DefaultSource = SourceServer
 	}
+	if c.endpoint == "" {
+		c.endpoint = resolveEndpoint()
+	}
 	if c.SampleRate <= 0 || c.SampleRate > 1.0 {
 		c.SampleRate = 1.0
 	}
 }
 
-// Client is the main ELS SDK instance. It is safe for concurrent use.
+// Client is the main ELS SDK instance. Create one with New, capture errors and
+// messages from anywhere (it is safe for concurrent use), and call Close on
+// shutdown to flush buffered entries. A background worker batches entries and a
+// pool of senders delivers them, so capture calls never block on the network.
 type Client struct {
 	config    Config
 	queue     chan *ErrorEntry
+	sendCh    chan []*ErrorEntry
+	flushReq  chan struct{}
 	transport *httpTransport
 	wg        sync.WaitGroup
+	senderWg  sync.WaitGroup
 	done      chan struct{}
 	closed    atomic.Bool
 	mu        sync.RWMutex
 	sessionID string
 	user      *UserContext
 	stats     Stats
+	inFlight  int64 // batches dispatched but not yet sent (atomic)
+	diskMu    sync.Mutex
+	batchPool sync.Pool
+	lastDrop  int64 // unix-nano of last overflow OnError (atomic, rate-limit)
 }
 
 // New creates and starts a new ELS Client. The background worker begins
 // immediately and will batch and send entries as they are captured.
 // Call Close() to gracefully shut down.
 func New(config Config) (*Client, error) {
-	if config.Endpoint == "" {
-		return nil, errors.New("els: Endpoint is required")
-	}
 	if config.APIKey == "" {
 		return nil, errors.New("els: APIKey is required")
 	}
@@ -178,19 +215,35 @@ func New(config Config) (*Client, error) {
 	c := &Client{
 		config:    config,
 		queue:     make(chan *ErrorEntry, config.BufferSize),
+		sendCh:    make(chan []*ErrorEntry, config.SenderConcurrency),
+		flushReq:  make(chan struct{}, 1),
 		done:      make(chan struct{}),
 		sessionID: generateSessionID(),
 		transport: newHTTPTransport(config),
 	}
+	batchCap := config.BatchSize
+	c.batchPool.New = func() any { return make([]*ErrorEntry, 0, batchCap) }
 
 	c.wg.Add(1)
 	go c.worker()
 
+	c.senderWg.Add(config.SenderConcurrency)
+	for i := 0; i < config.SenderConcurrency; i++ {
+		go c.sender()
+	}
+
 	return c, nil
 }
 
-// CaptureError captures an error with an automatic stack trace and optional options.
-// Returns immediately; the entry is sent asynchronously.
+// CaptureError captures a Go error and sends it asynchronously. A stack trace
+// is captured automatically at the call site, and the level defaults to
+// Config.DefaultLevel ("error"). Returns immediately and never blocks; a nil
+// err is a no-op. Enrich the entry with WithURL, WithLevel, WithMeta, etc.
+//
+//	client.CaptureError(err, els.WithURL("/api/orders"), els.WithLevel(els.LevelCritical))
+//
+// For guaranteed delivery of critical errors, use SendSync instead. To attach a
+// request/trace ID from a context.Context, use CaptureErrorCtx.
 func (c *Client) CaptureError(err error, opts ...CaptureOption) {
 	if err == nil {
 		return
@@ -212,8 +265,12 @@ func (c *Client) CaptureError(err error, opts ...CaptureOption) {
 	c.enqueue(entry)
 }
 
-// CaptureMessage captures a text message at the given level.
-func (c *Client) CaptureMessage(msg string, level string, opts ...CaptureOption) {
+// CaptureMessage captures a text message at the given level and sends it
+// asynchronously (no stack trace). Returns immediately and never blocks.
+// The Debug/Info/Warning/Error/Critical shortcuts wrap this method.
+//
+//	client.CaptureMessage("cache rebuilt", els.LevelInfo, els.WithMeta(map[string]any{"keys": 1280}))
+func (c *Client) CaptureMessage(msg string, level Level, opts ...CaptureOption) {
 	entry := &ErrorEntry{
 		Message:   msg,
 		Level:     level,
@@ -326,43 +383,34 @@ func (c *Client) SendSyncEntry(ctx context.Context, entry ErrorEntry, opts ...Ca
 
 // Health checks connectivity to the ELS server. Returns nil if the server is reachable.
 func (c *Client) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.config.Endpoint+"/health", nil)
-	if err != nil {
-		return fmt.Errorf("els: create health request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-
-	resp, err := c.transport.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("els: health check failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("els: health check returned status %d", resp.StatusCode)
-	}
-	return nil
+	return c.transport.health(ctx)
 }
 
-// Flush blocks until the current queue is drained or FlushTimeout elapses.
+// Flush blocks until all currently queued and in-flight entries are sent, or
+// FlushTimeout elapses.
 func (c *Client) Flush() {
 	c.FlushWithTimeout(c.config.FlushTimeout)
 }
 
-// FlushWithTimeout blocks until the queue is drained or the given timeout elapses.
+// FlushWithTimeout blocks until the queue is drained, no batch is in flight, or
+// the given timeout elapses. Unlike a naive queue-length check, this waits for
+// batches that the sender pool is still delivering.
 func (c *Client) FlushWithTimeout(timeout time.Duration) {
-	deadline := time.After(timeout)
+	deadline := time.Now().Add(timeout)
 	for {
+		// Nudge the worker to hand off its partial batch immediately.
 		select {
-		case <-deadline:
-			return
+		case c.flushReq <- struct{}{}:
 		default:
-			if len(c.queue) == 0 {
-				time.Sleep(100 * time.Millisecond)
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
 		}
+
+		if len(c.queue) == 0 && atomic.LoadInt64(&c.inFlight) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -375,7 +423,8 @@ func (c *Client) Close() error {
 	}
 
 	close(c.done)
-	c.wg.Wait()
+	c.wg.Wait()       // worker drains queue, dispatches remainder, closes sendCh
+	c.senderWg.Wait() // senders finish in-flight batches
 	return nil
 }
 
@@ -433,6 +482,7 @@ func (c *Client) enqueue(entry *ErrorEntry) {
 	default:
 		// Queue full: drop oldest entry and push new one
 		atomic.AddInt64(&c.stats.Dropped, 1)
+		c.notifyDrop()
 		select {
 		case <-c.queue:
 		default:
@@ -443,6 +493,22 @@ func (c *Client) enqueue(entry *ErrorEntry) {
 		case <-c.done:
 		default:
 		}
+	}
+}
+
+// notifyDrop calls OnError when the queue overflows, rate-limited to at most
+// once per second so a sustained overload doesn't flood the callback.
+func (c *Client) notifyDrop() {
+	if c.config.OnError == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&c.lastDrop)
+	if now-last < int64(time.Second) {
+		return
+	}
+	if atomic.CompareAndSwapInt64(&c.lastDrop, last, now) {
+		c.config.OnError(fmt.Errorf("els: queue full (cap %d), dropping oldest entries — increase BufferSize or SenderConcurrency", c.config.BufferSize))
 	}
 }
 
@@ -461,26 +527,15 @@ func (c *Client) enrichDefaults(entry *ErrorEntry) {
 	}
 }
 
-// levelPriority returns numeric priority for level comparison.
-var levelPriority = map[string]int{
-	LevelDebug:    0,
-	LevelInfo:     1,
-	LevelWarning:  2,
-	LevelError:    3,
-	LevelCritical: 4,
-}
-
 // shouldCapture returns true if the entry's level meets the MinLevel threshold.
-func (c *Client) shouldCapture(level string) bool {
+func (c *Client) shouldCapture(level Level) bool {
 	if c.config.MinLevel == "" {
 		return true
 	}
-	minP, ok := levelPriority[c.config.MinLevel]
-	if !ok {
-		return true
-	}
-	entryP, ok := levelPriority[level]
-	if !ok {
+	minP := c.config.MinLevel.Priority()
+	entryP := level.Priority()
+	// Unknown levels (priority -1) are always captured, preserving prior behavior.
+	if minP < 0 || entryP < 0 {
 		return true
 	}
 	return entryP >= minP
@@ -495,8 +550,9 @@ func generateSessionID() string {
 }
 
 // shouldSample returns true based on the configured SampleRate probability.
+// Uses math/rand/v2 which is lock-free (no global mutex contention).
 func (c *Client) shouldSample() bool {
-	return mathrand.Float64() < c.config.SampleRate
+	return rand.Float64() < c.config.SampleRate
 }
 
 // enrichUserContext attaches user info to the entry's Meta if a user is set.
@@ -536,9 +592,16 @@ func captureStack(skip int) string {
 
 	frames := runtime.CallersFrames(pcs[:n])
 	var sb strings.Builder
+	sb.Grow(n * 96) // rough per-frame estimate to avoid regrowth
 	for {
 		frame, more := frames.Next()
-		fmt.Fprintf(&sb, "%s\n\t%s:%d\n", frame.Function, frame.File, frame.Line)
+		// Manual formatting avoids fmt reflection in the hot path.
+		sb.WriteString(frame.Function)
+		sb.WriteString("\n\t")
+		sb.WriteString(frame.File)
+		sb.WriteByte(':')
+		sb.WriteString(strconv.Itoa(frame.Line))
+		sb.WriteByte('\n')
 		if !more {
 			break
 		}
