@@ -18,7 +18,6 @@ import (
 func main() {
 	// Initialize the ELS client
 	client, err := els.New(els.Config{
-		// Endpoint is hardcoded in the SDK — no need to configure it.
 		APIKey:        os.Getenv("ELS_API_KEY"),
 		AppSlug:       "web-api",
 		DeploymentEnv: "PRODUCTION",

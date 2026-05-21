@@ -39,7 +39,6 @@ import (
 func main() {
     // Вариант A: глобальный клиент (рекомендуется для большинства приложений)
     if err := els.Init(els.Config{
-        // Endpoint захардкожен в SDK — указывать не нужно.
         APIKey:        os.Getenv("ELS_API_KEY"),
         AppSlug:       "my-service",
         DeploymentEnv: "PRODUCTION",
@@ -252,7 +251,7 @@ if els.IsRetryableErr(err) {
 ```go
 els.Config{
     // Обязательные
-    APIKey string // API-ключ (endpoint захардкожен в SDK)
+    APIKey string // API-ключ
 
     // Идентификация (рекомендуется)
     AppSlug       string // Идентификатор приложения

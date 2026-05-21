@@ -32,8 +32,7 @@ func resolveEndpoint() string {
 
 // Config holds the SDK configuration.
 type Config struct {
-	// endpoint is hardcoded to the ELS API URL and is not part of the public API.
-	// Internal-only (tests / self-hosted via ELS_ENDPOINT env).
+	// Internal-only; resolved from defaultEndpoint (tests / self-hosted via ELS_ENDPOINT env).
 	endpoint string
 
 	// APIKey is the authentication key for the ELS API (required).

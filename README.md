@@ -39,7 +39,6 @@ import (
 func main() {
     // Option A: global client (recommended for most apps)
     if err := els.Init(els.Config{
-        // Endpoint is hardcoded in the SDK — no need to configure it.
         APIKey:        os.Getenv("ELS_API_KEY"),
         AppSlug:       "my-service",
         DeploymentEnv: "PRODUCTION",
@@ -294,7 +293,7 @@ els.CaptureErrorGlobal(err, els.WithAppVersion("client-app-v3"), els.WithMeta(ma
 ```go
 els.Config{
     // Required
-    APIKey string // API key (endpoint is hardcoded in the SDK)
+    APIKey string // API key
 
     // Identity (recommended)
     AppSlug       string // Application identifier

@@ -1,6 +1,6 @@
 // Пример: минимально возможная интеграция с ELS.
 //
-// Обязательны только APIKey и AppSlug — endpoint захардкожен в SDK.
+// Обязательны только APIKey и AppSlug.
 package main
 
 import (

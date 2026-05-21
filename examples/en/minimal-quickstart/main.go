@@ -1,6 +1,6 @@
 // Example: the smallest possible ELS integration.
 //
-// Only APIKey and AppSlug are required — the endpoint is hardcoded in the SDK.
+// Only APIKey and AppSlug are required.
 package main
 
 import (
